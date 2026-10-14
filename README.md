@@ -1,2 +1,15 @@
 # k3-engine
-K3 AI platform low-level runtime - 16-core RISC-V VLA RVV loops and synchronization spikes.
+
+Low-level compute runtime for the SpacemiT K3 AI platform (16 RISC-V cores, 32GB Unified RAM).
+
+## Overview
+`k3-engine` implements the high-performance execution engine targeted at `riscv64`:
+- **Compute Kernels**: Unified VLA RVV 1.0 loops with A100 IME acceleration.
+- **Quantization**: Qwen/LLaMA Q4_K_M first.
+- **Synchronization**: Thread group scheduling and diagnostic spikes (`spin`, `futex`, `rayon`).
+- **Memory**: Paged KV cache allocator and eviction engine.
+
+## Architecture & Specifications
+For master architecture and detailed component specifications, see the parent [model-runner](https://github.com/LMA1980/model-runner) repository:
+- Master Plan: [PLAN.md](https://github.com/LMA1980/model-runner/blob/main/PLAN.md)
+- Specs: [specs/runtime/](https://github.com/LMA1980/model-runner/tree/main/specs/runtime)
