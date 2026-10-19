@@ -10,6 +10,9 @@ repository = "https://github.com/LMA1980/k3-engine"
 [lints]
 workspace = true
 
+[dependencies]
+k3-core = { workspace = true }
+
 [features]
 default = ["arch-synthetic", "kernels-rvv"]
 # In-process architecture recipe and compute kernel feature gates (ADR-024)
