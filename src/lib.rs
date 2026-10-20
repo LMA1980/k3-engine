@@ -4,7 +4,9 @@
 //! in-process via Cargo feature gates per ADR-024, targeting `riscv64gc-unknown-linux-gnu`
 //! with RVV 1.0 (`+v`) per ADR-029.
 
-pub use k3_core::{self, ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType, TensorView};
+pub use k3_core::{
+    self, ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType, TensorView,
+};
 
 /// Indicates whether the `arch-synthetic` architecture recipe feature gate is enabled.
 pub const HAS_ARCH_SYNTHETIC: bool = cfg!(feature = "arch-synthetic");
