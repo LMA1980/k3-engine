@@ -4,8 +4,12 @@
 //! in-process via Cargo feature gates per ADR-024, targeting `riscv64gc-unknown-linux-gnu`
 //! with RVV 1.0 (`+v`) per ADR-029.
 
+pub mod capability;
+
+pub use capability::{RecipeRegistry, verify_metadata_capabilities, verify_model_capabilities};
 pub use k3_core::{
-    self, ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType, TensorView,
+    self, ArchRecipe, ExecutionContext, GgufFile, K3Error, ModelMetadata, ModelWeights, QuantType,
+    TensorDescriptor, TensorView,
 };
 
 #[cfg(feature = "arch-synthetic")]

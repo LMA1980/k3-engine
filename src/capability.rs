@@ -1,0 +1,164 @@
+//! Architecture recipe capability filter and compile-time registry.
+//!
+//! Enforces upfront capability verification against compiled `arch-*` recipes and compute kernels
+//! before reserving or locking memory (ADR-017, ADR-023, ADR-024, US-01 Scenario 1).
+
+use k3_core::{ArchRecipe, GgufFile, K3Error, ModelMetadata};
+
+/// In-process compile-time registry mapping GGUF `general.architecture` strings
+/// to compiled [`ArchRecipe`] implementations (ADR-023, ADR-024).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RecipeRegistry;
+
+impl RecipeRegistry {
+    /// Returns the compiled [`ArchRecipe`] matching `architecture`, if enabled.
+    ///
+    /// Minor versions (such as `"qwen3"` vs `"qwen3.8"`) are treated as distinct algorithms
+    /// per ADR-023 and must be registered separately.
+    #[must_use]
+    pub fn find_recipe(architecture: &str) -> Option<&'static dyn ArchRecipe> {
+        #[cfg(feature = "arch-synthetic")]
+        if architecture == "synthetic" {
+            static SYNTHETIC: arch_synthetic::SyntheticRecipe =
+                arch_synthetic::SyntheticRecipe::new();
+            return Some(&SYNTHETIC);
+        }
+
+        let _ = architecture;
+        None
+    }
+
+    /// Returns a list of architecture identifiers compiled into the current binary.
+    #[must_use]
+    pub const fn supported_architectures() -> &'static [&'static str] {
+        #[cfg(feature = "arch-synthetic")]
+        {
+            &["synthetic"]
+        }
+
+        #[cfg(not(feature = "arch-synthetic"))]
+        {
+            &[]
+        }
+    }
+}
+
+/// Verifies that the model's architecture recipe is compiled and that every tensor's
+/// quantization layout is supported by the active backend (ADR-023, US-01 Scenario 1).
+///
+/// # Errors
+///
+/// Returns [`K3Error::CapabilityMismatch`] if:
+/// - The model's `general.architecture` has no compiled recipe in this binary.
+/// - Any tensor in the model uses a quantization layout unsupported by the matching recipe.
+/// - The trained context window is zero.
+pub fn verify_model_capabilities(model: &GgufFile<'_>) -> Result<&'static dyn ArchRecipe, K3Error> {
+    verify_metadata_capabilities(model.metadata())
+}
+
+/// Verifies that the extracted [`ModelMetadata`] satisfies compile-time recipe and
+/// quantization capabilities before allocating or `mlock`ing weight buffers.
+///
+/// # Errors
+///
+/// Returns [`K3Error::CapabilityMismatch`] if capability checks fail.
+pub fn verify_metadata_capabilities(
+    metadata: &ModelMetadata,
+) -> Result<&'static dyn ArchRecipe, K3Error> {
+    let arch = metadata.architecture();
+
+    // 1. Upfront architecture recipe lookup (ADR-023)
+    let recipe = RecipeRegistry::find_recipe(arch).ok_or_else(|| K3Error::CapabilityMismatch {
+        architecture: arch.to_owned(),
+        reason: format!(
+            "architecture '{arch}' is not compiled into this binary (compiled recipes: {:?})",
+            RecipeRegistry::supported_architectures()
+        ),
+    })?;
+
+    // 2. Validate every tensor quantization format against the active recipe and kernels
+    for tensor in metadata.tensors() {
+        if !recipe.supports_quant(tensor.quant()) {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: arch.to_owned(),
+                reason: format!(
+                    "quantization format '{}' of tensor '{}' is not supported by recipe '{arch}'",
+                    tensor.quant(),
+                    tensor.name()
+                ),
+            });
+        }
+    }
+
+    // 3. Validate context window bound (ADR-027)
+    if metadata.context_length() == 0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: arch.to_owned(),
+            reason: format!(
+                "model context length for architecture '{arch}' must be greater than 0"
+            ),
+        });
+    }
+
+    Ok(recipe)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use k3_core::QuantType;
+    use k3_core::test_helpers::create_synthetic_gguf_v3;
+
+    #[test]
+    fn test_supported_architectures_list() {
+        let archs = RecipeRegistry::supported_architectures();
+        #[cfg(feature = "arch-synthetic")]
+        assert!(archs.contains(&"synthetic"));
+    }
+
+    #[cfg(feature = "arch-synthetic")]
+    #[test]
+    fn test_verify_valid_synthetic_model_succeeds() {
+        let tensor_specs = [
+            ("blk.0.attn_q.weight", QuantType::Q4_K_M, &[256, 2][..]),
+            ("output_norm.weight", QuantType::F32, &[16][..]),
+        ];
+        let bytes = create_synthetic_gguf_v3("synthetic", 32, &tensor_specs);
+        let model = GgufFile::parse(&bytes).expect("GGUF parse succeeds");
+
+        let recipe = verify_model_capabilities(&model).expect("capability check succeeds");
+        assert_eq!(recipe.architecture_id(), "synthetic");
+    }
+
+    #[test]
+    fn test_verify_unsupported_architecture_rejected() {
+        // qwen3.8 is an uncompiled architecture recipe (ADR-023)
+        let tensor_specs = [("weight", QuantType::F32, &[16][..])];
+        let bytes = create_synthetic_gguf_v3("qwen3.8", 32, &tensor_specs);
+        let model = GgufFile::parse(&bytes).expect("GGUF parse succeeds");
+
+        let err = verify_model_capabilities(&model).expect_err("must reject qwen3.8");
+        assert!(matches!(err, K3Error::CapabilityMismatch { .. }));
+        assert_eq!(err.diagnostic_code(), "capability_mismatch");
+        assert!(
+            err.to_string()
+                .contains("architecture 'qwen3.8' is not compiled")
+        );
+    }
+
+    #[cfg(feature = "arch-synthetic")]
+    #[test]
+    fn test_verify_unsupported_quantization_rejected() {
+        // SyntheticRecipe does not support Q8_0 (only F32, F16, BF16, Q4_K_M)
+        let tensor_specs = [("blk.0.attn_q.weight", QuantType::Q8_0, &[32][..])];
+        let bytes = create_synthetic_gguf_v3("synthetic", 32, &tensor_specs);
+        let model = GgufFile::parse(&bytes).expect("GGUF parse succeeds");
+
+        let err = verify_model_capabilities(&model).expect_err("must reject Q8_0 on synthetic");
+        assert!(matches!(err, K3Error::CapabilityMismatch { .. }));
+        assert_eq!(err.diagnostic_code(), "capability_mismatch");
+        assert!(err.to_string().contains(
+            "quantization format 'Q8_0' of tensor 'blk.0.attn_q.weight' is not supported"
+        ));
+    }
+}
