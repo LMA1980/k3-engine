@@ -11,10 +11,12 @@ repository = "https://github.com/LMA1980/k3-engine"
 workspace = true
 
 [dependencies]
+arch-synthetic = { workspace = true, optional = true }
 k3-core = { workspace = true }
+kernels-rvv = { workspace = true, optional = true }
 
 [features]
 default = ["arch-synthetic", "kernels-rvv"]
 # In-process architecture recipe and compute kernel feature gates (ADR-024)
-arch-synthetic = []
-kernels-rvv = []
+arch-synthetic = ["dep:arch-synthetic"]
+kernels-rvv = ["dep:kernels-rvv"]

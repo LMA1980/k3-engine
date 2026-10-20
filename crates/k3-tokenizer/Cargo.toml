@@ -1,0 +1,14 @@
+[package]
+name = "k3-tokenizer"
+description = "Shared tokenizer and chat-template library for the SpacemiT K3 platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository = "https://github.com/LMA1980/k3-engine"
+
+[lints]
+workspace = true
+
+[dependencies]
+k3-core = { workspace = true }

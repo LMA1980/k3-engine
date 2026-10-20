@@ -8,6 +8,12 @@ pub use k3_core::{
     self, ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType, TensorView,
 };
 
+#[cfg(feature = "arch-synthetic")]
+pub use arch_synthetic;
+
+#[cfg(feature = "kernels-rvv")]
+pub use kernels_rvv;
+
 /// Indicates whether the `arch-synthetic` architecture recipe feature gate is enabled.
 pub const HAS_ARCH_SYNTHETIC: bool = cfg!(feature = "arch-synthetic");
 
@@ -23,5 +29,24 @@ mod tests {
         assert_eq!(HAS_ARCH_SYNTHETIC, cfg!(feature = "arch-synthetic"));
         assert_eq!(HAS_KERNELS_RVV, cfg!(feature = "kernels-rvv"));
         assert_eq!(QuantType::Q4_K_M.as_str(), "Q4_K_M");
+    }
+
+    #[cfg(feature = "arch-synthetic")]
+    #[test]
+    fn arch_synthetic_recipe_wired() {
+        use super::ArchRecipe;
+        use super::arch_synthetic::SyntheticRecipe;
+
+        let recipe = SyntheticRecipe::new();
+        assert_eq!(recipe.architecture_id(), "synthetic");
+    }
+
+    #[cfg(feature = "kernels-rvv")]
+    #[test]
+    fn kernels_rvv_wired() {
+        use super::kernels_rvv::{BaselineKernel, VectorKernel};
+
+        let kernel = BaselineKernel::new();
+        assert!((kernel.dot_product_f32(&[2.0], &[3.0]) - 6.0).abs() < f32::EPSILON);
     }
 }

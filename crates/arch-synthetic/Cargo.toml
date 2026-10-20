@@ -1,0 +1,19 @@
+[package]
+name = "arch-synthetic"
+description = "Synthetic reference architecture recipe for the SpacemiT K3 platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository = "https://github.com/LMA1980/k3-engine"
+
+[lints]
+workspace = true
+
+[dependencies]
+k3-core = { workspace = true }
+kernels-rvv = { workspace = true, optional = true }
+
+[features]
+default = []
+with-kernels = ["dep:kernels-rvv"]
