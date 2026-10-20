@@ -5,12 +5,22 @@
 //! with RVV 1.0 (`+v`) per ADR-029.
 
 pub mod capability;
+pub mod kv;
+pub mod memory;
+pub mod weights;
 
 pub use capability::{RecipeRegistry, verify_metadata_capabilities, verify_model_capabilities};
 pub use k3_core::{
     self, ArchRecipe, ExecutionContext, GgufFile, K3Error, ModelMetadata, ModelWeights, QuantType,
     TensorDescriptor, TensorView,
 };
+pub use kv::SingleSlotKvArena;
+pub use memory::{
+    DEFAULT_PAGE_SIZE, KV_BLOCK_SIZE, MemoryFootprint, MemoryInspector, MockMemoryInspector,
+    SystemMemoryInspector, calculate_footprint, check_memory_admission,
+    check_memory_admission_with, system_page_size,
+};
+pub use weights::LockedModelWeights;
 
 #[cfg(feature = "arch-synthetic")]
 pub use arch_synthetic;

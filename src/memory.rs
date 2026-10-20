@@ -1,0 +1,476 @@
+//! Pre-flight memory footprint calculation and physical RAM admission checks.
+//!
+//! Enforces deterministic upfront admission checking against available physical memory
+//! (`MemAvailable` in `/proc/meminfo`) and process lockable limits (`RLIMIT_MEMLOCK`),
+//! refusing runs before forward passes begin (ADR-027, ADR-037, US-01 Scenario 3).
+
+use std::fs;
+use std::io::{BufRead, BufReader};
+
+use k3_core::{K3Error, ModelMetadata, align_up};
+
+/// Default system page size fallback in bytes if `sysconf` query fails.
+pub const DEFAULT_PAGE_SIZE: usize = 4096;
+
+/// Tokens per KV block in the paged KV cache arena (ADR-004, `kv-allocator.md`).
+pub const KV_BLOCK_SIZE: usize = 16;
+
+/// Returns the system memory page size in bytes.
+#[must_use]
+pub fn system_page_size() -> usize {
+    // SAFETY: sysconf(_SC_PAGESIZE) is a standard POSIX query with no side effects.
+    let val = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if val > 0 {
+        usize::try_from(val).unwrap_or(DEFAULT_PAGE_SIZE)
+    } else {
+        DEFAULT_PAGE_SIZE
+    }
+}
+
+/// Structured page-aligned memory footprint for a model placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryFootprint {
+    /// Exact page-aligned bytes required for mapped model weights.
+    pub weight_bytes: u64,
+    /// Exact page-aligned bytes required for the single-slot KV cache arena.
+    pub kv_bytes: u64,
+    /// Total page-aligned bytes required (`weight_bytes + kv_bytes`).
+    pub total_required_bytes: u64,
+    /// Number of 16-token blocks allocated for the KV cache.
+    pub kv_block_count: usize,
+    /// Total token capacity allocated for the KV cache (`kv_block_count * 16`).
+    pub kv_allocated_tokens: usize,
+}
+
+/// Computes the exact page-aligned memory footprint required for model weights
+/// and a standalone single-slot KV cache arena sized to `n_ctx` tokens (ADR-027, ADR-037).
+///
+/// # Errors
+///
+/// Returns [`K3Error::ContextLengthExceeded`] if `n_ctx` exceeds the model's trained context limit.
+/// Returns [`K3Error::CapabilityMismatch`] if `n_ctx` is zero or if required architecture dimensions are zero.
+pub fn calculate_footprint(
+    metadata: &ModelMetadata,
+    n_ctx: usize,
+) -> Result<MemoryFootprint, K3Error> {
+    if n_ctx == 0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: metadata.architecture().to_owned(),
+            reason: "requested context length n_ctx must be greater than zero".to_owned(),
+        });
+    }
+
+    if metadata.context_length() > 0 && n_ctx > metadata.context_length() {
+        return Err(K3Error::ContextLengthExceeded {
+            requested_tokens: n_ctx,
+            max_context_tokens: metadata.context_length(),
+        });
+    }
+
+    let page_size = system_page_size();
+
+    // 1. Model weights footprint (page-aligned)
+    let weight_bytes_raw = metadata.total_weight_bytes();
+    let weight_bytes_aligned = align_up(weight_bytes_raw, page_size);
+    let weight_bytes =
+        u64::try_from(weight_bytes_aligned).map_err(|_| K3Error::TensorBoundsError {
+            tensor_name: "weights".to_owned(),
+            offset: 0,
+            byte_len: weight_bytes_aligned,
+            buffer_len: usize::MAX,
+            reason: "aligned weight bytes overflow u64".to_owned(),
+        })?;
+
+    // 2. Standalone single-slot KV cache footprint (16-token blocks, page-aligned)
+    let kv_block_count = n_ctx.div_ceil(KV_BLOCK_SIZE);
+    let kv_allocated_tokens =
+        kv_block_count
+            .checked_mul(KV_BLOCK_SIZE)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: usize::MAX,
+                reason: "kv allocated tokens overflow usize".to_owned(),
+            })?;
+
+    let layer_count = metadata.layer_count().max(1);
+    let head_count_kv = metadata.head_count_kv().max(1);
+    let head_dim = if metadata.head_count() > 0 {
+        metadata.embedding_dim() / metadata.head_count()
+    } else {
+        metadata.embedding_dim()
+    }
+    .max(1);
+
+    // Each token stores Key and Value vectors: 2 * layer_count * head_count_kv * head_dim (f32 elements)
+    let elements_per_token = 2usize
+        .checked_mul(layer_count)
+        .and_then(|v| v.checked_mul(head_count_kv))
+        .and_then(|v| v.checked_mul(head_dim))
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: usize::MAX,
+            reason: "kv elements per token calculation overflowed usize".to_owned(),
+        })?;
+
+    let total_elements = kv_allocated_tokens
+        .checked_mul(elements_per_token)
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: usize::MAX,
+            reason: "total kv elements calculation overflowed usize".to_owned(),
+        })?;
+
+    let raw_kv_bytes = total_elements
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: usize::MAX,
+            reason: "raw kv bytes calculation overflowed usize".to_owned(),
+        })?;
+
+    let kv_bytes_aligned = align_up(raw_kv_bytes, page_size);
+    let kv_bytes = u64::try_from(kv_bytes_aligned).map_err(|_| K3Error::TensorBoundsError {
+        tensor_name: "kv_cache".to_owned(),
+        offset: 0,
+        byte_len: kv_bytes_aligned,
+        buffer_len: usize::MAX,
+        reason: "aligned kv bytes overflow u64".to_owned(),
+    })?;
+
+    let total_required_bytes =
+        weight_bytes
+            .checked_add(kv_bytes)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "memory_footprint".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: usize::MAX,
+                reason: "total required bytes overflowed u64".to_owned(),
+            })?;
+
+    Ok(MemoryFootprint {
+        weight_bytes,
+        kv_bytes,
+        total_required_bytes,
+        kv_block_count,
+        kv_allocated_tokens,
+    })
+}
+
+/// Trait abstracting system physical RAM and lockable memory limits inspection.
+pub trait MemoryInspector {
+    /// Returns currently available physical memory in bytes (from `/proc/meminfo` `MemAvailable`).
+    ///
+    /// # Errors
+    /// Returns [`K3Error::InsufficientLockableMemory`] if inspection fails.
+    fn available_memory_bytes(&self) -> Result<u64, K3Error>;
+
+    /// Returns the process lockable memory limit (`RLIMIT_MEMLOCK`) in bytes.
+    /// Returns `u64::MAX` if unlimited.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::InsufficientLockableMemory`] if the limit query fails.
+    fn rlimit_memlock_bytes(&self) -> Result<u64, K3Error>;
+}
+
+/// Standard system memory inspector reading from Linux `/proc/meminfo` and `libc::getrlimit`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemMemoryInspector;
+
+impl SystemMemoryInspector {
+    /// Creates a new system memory inspector.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl MemoryInspector for SystemMemoryInspector {
+    fn available_memory_bytes(&self) -> Result<u64, K3Error> {
+        let file = fs::File::open("/proc/meminfo").map_err(|_err| {
+            K3Error::InsufficientLockableMemory {
+                required_bytes: 0,
+                weight_bytes: 0,
+                kv_bytes: 0,
+                available_bytes: 0,
+                rlimit_memlock_bytes: 0,
+            }
+        })?;
+
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            let Ok(entry) = line else { continue };
+            if let Some(rest) = entry.strip_prefix("MemAvailable:") {
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                if let Some(kb_str) = parts.first() {
+                    if let Ok(kb) = kb_str.parse::<u64>() {
+                        return kb
+                            .checked_mul(1024)
+                            .ok_or(K3Error::InsufficientLockableMemory {
+                                required_bytes: 0,
+                                weight_bytes: 0,
+                                kv_bytes: 0,
+                                available_bytes: 0,
+                                rlimit_memlock_bytes: 0,
+                            });
+                    }
+                }
+            }
+        }
+
+        // Fallback: query sysconf if /proc/meminfo parsing did not find MemAvailable
+        // SAFETY: sysconf(_SC_AVPHYS_PAGES) is a POSIX query with no side effects.
+        let pages = unsafe { libc::sysconf(libc::_SC_AVPHYS_PAGES) };
+        // SAFETY: sysconf(_SC_PAGESIZE) is a POSIX query with no side effects.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if pages > 0 && page_size > 0 {
+            if let (Ok(p), Ok(ps)) = (u64::try_from(pages), u64::try_from(page_size)) {
+                return Ok(p.saturating_mul(ps));
+            }
+        }
+
+        Err(K3Error::InsufficientLockableMemory {
+            required_bytes: 0,
+            weight_bytes: 0,
+            kv_bytes: 0,
+            available_bytes: 0,
+            rlimit_memlock_bytes: 0,
+        })
+    }
+
+    fn rlimit_memlock_bytes(&self) -> Result<u64, K3Error> {
+        let mut rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+
+        // SAFETY: getrlimit with RLIMIT_MEMLOCK passes a valid pointer to libc::rlimit.
+        let ret = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &raw mut rlim) };
+        if ret != 0 {
+            return Err(K3Error::InsufficientLockableMemory {
+                required_bytes: 0,
+                weight_bytes: 0,
+                kv_bytes: 0,
+                available_bytes: 0,
+                rlimit_memlock_bytes: 0,
+            });
+        }
+
+        #[allow(clippy::useless_conversion)]
+        if rlim.rlim_cur == libc::RLIM_INFINITY {
+            Ok(u64::MAX)
+        } else {
+            Ok(rlim.rlim_cur)
+        }
+    }
+}
+
+/// Deterministic mock memory inspector for testing admission boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MockMemoryInspector {
+    /// Mocked available RAM in bytes.
+    pub available_bytes: u64,
+    /// Mocked process `RLIMIT_MEMLOCK` in bytes.
+    pub rlimit_memlock_bytes: u64,
+}
+
+impl MockMemoryInspector {
+    /// Creates a mock memory inspector with explicit available and lockable memory bounds.
+    #[must_use]
+    pub const fn new(available_bytes: u64, rlimit_memlock_bytes: u64) -> Self {
+        Self {
+            available_bytes,
+            rlimit_memlock_bytes,
+        }
+    }
+}
+
+impl MemoryInspector for MockMemoryInspector {
+    fn available_memory_bytes(&self) -> Result<u64, K3Error> {
+        Ok(self.available_bytes)
+    }
+
+    fn rlimit_memlock_bytes(&self) -> Result<u64, K3Error> {
+        Ok(self.rlimit_memlock_bytes)
+    }
+}
+
+/// Verifies that required model weights and the single-slot KV cache arena do not exceed
+/// currently available physical memory or the process lockable limit (`RLIMIT_MEMLOCK`).
+///
+/// # Errors
+///
+/// Returns [`K3Error::InsufficientLockableMemory`] if total required bytes exceed available RAM
+/// or `RLIMIT_MEMLOCK` (ADR-037, US-01 Scenario 3).
+pub fn check_memory_admission(
+    metadata: &ModelMetadata,
+    n_ctx: usize,
+) -> Result<MemoryFootprint, K3Error> {
+    check_memory_admission_with(metadata, n_ctx, &SystemMemoryInspector::new())
+}
+
+/// Verifies pre-flight memory admission using a customized or mocked memory inspector.
+///
+/// # Errors
+///
+/// Returns [`K3Error::InsufficientLockableMemory`] if required footprint exceeds lockable limits.
+pub fn check_memory_admission_with<I: MemoryInspector>(
+    metadata: &ModelMetadata,
+    n_ctx: usize,
+    inspector: &I,
+) -> Result<MemoryFootprint, K3Error> {
+    let footprint = calculate_footprint(metadata, n_ctx)?;
+    let available_bytes = inspector.available_memory_bytes()?;
+    let rlimit_memlock_bytes = inspector.rlimit_memlock_bytes()?;
+
+    if footprint.total_required_bytes > available_bytes
+        || footprint.total_required_bytes > rlimit_memlock_bytes
+    {
+        return Err(K3Error::InsufficientLockableMemory {
+            required_bytes: footprint.total_required_bytes,
+            weight_bytes: footprint.weight_bytes,
+            kv_bytes: footprint.kv_bytes,
+            available_bytes,
+            rlimit_memlock_bytes,
+        });
+    }
+
+    Ok(footprint)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use k3_core::GgufFile;
+    use k3_core::QuantType;
+    use k3_core::test_helpers::create_synthetic_gguf_v3;
+
+    #[test]
+    fn test_footprint_calculation_page_aligned() {
+        let tensor_specs = [
+            ("blk.0.attn_q.weight", QuantType::Q4_K_M, &[256, 2][..]),
+            ("output_norm.weight", QuantType::F32, &[16][..]),
+        ];
+        let bytes = create_synthetic_gguf_v3("synthetic", 32, &tensor_specs);
+        let model = GgufFile::parse(&bytes).expect("parse model");
+        let meta = model.metadata();
+
+        // 32 tokens requested -> 2 blocks of 16 tokens -> 32 allocated tokens
+        let footprint = calculate_footprint(meta, 32).expect("footprint calculation succeeds");
+        let page = system_page_size();
+
+        assert_eq!(footprint.kv_block_count, 2);
+        assert_eq!(footprint.kv_allocated_tokens, 32);
+        assert_eq!(footprint.weight_bytes % page as u64, 0);
+        assert_eq!(footprint.kv_bytes % page as u64, 0);
+        assert_eq!(
+            footprint.total_required_bytes,
+            footprint.weight_bytes + footprint.kv_bytes
+        );
+    }
+
+    #[test]
+    fn test_memory_admission_succeeds_when_capacity_sufficient() {
+        let tensor_specs = [("weight", QuantType::F32, &[16][..])];
+        let bytes = create_synthetic_gguf_v3("synthetic", 32, &tensor_specs);
+        let model = GgufFile::parse(&bytes).expect("parse model");
+        let meta = model.metadata();
+
+        let inspector = MockMemoryInspector::new(100_000_000, 100_000_000);
+        let admission = check_memory_admission_with(meta, 32, &inspector);
+        assert!(admission.is_ok());
+    }
+
+    #[test]
+    fn test_memory_admission_refuses_when_exceeding_available_ram() {
+        let tensor_specs = [("weight", QuantType::F32, &[16][..])];
+        let bytes = create_synthetic_gguf_v3("synthetic", 32, &tensor_specs);
+        let model = GgufFile::parse(&bytes).expect("parse model");
+        let meta = model.metadata();
+
+        // Available RAM is only 100 bytes (far less than page-aligned footprint)
+        let inspector = MockMemoryInspector::new(100, 100_000_000);
+        let err = check_memory_admission_with(meta, 32, &inspector)
+            .expect_err("must refuse upfront when available RAM is insufficient");
+
+        match err {
+            K3Error::InsufficientLockableMemory {
+                required_bytes,
+                weight_bytes,
+                kv_bytes,
+                available_bytes,
+                rlimit_memlock_bytes,
+            } => {
+                assert!(required_bytes > available_bytes);
+                assert_eq!(available_bytes, 100);
+                assert_eq!(rlimit_memlock_bytes, 100_000_000);
+                assert_eq!(required_bytes, weight_bytes + kv_bytes);
+            }
+            other => panic!("expected InsufficientLockableMemory, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_memory_admission_refuses_when_exceeding_rlimit_memlock() {
+        let tensor_specs = [("weight", QuantType::F32, &[16][..])];
+        let bytes = create_synthetic_gguf_v3("synthetic", 32, &tensor_specs);
+        let model = GgufFile::parse(&bytes).expect("parse model");
+        let meta = model.metadata();
+
+        // RLIMIT_MEMLOCK is only 500 bytes
+        let inspector = MockMemoryInspector::new(100_000_000, 500);
+        let err = check_memory_admission_with(meta, 32, &inspector)
+            .expect_err("must refuse upfront when RLIMIT_MEMLOCK is exceeded");
+
+        match err {
+            K3Error::InsufficientLockableMemory {
+                required_bytes,
+                available_bytes,
+                rlimit_memlock_bytes,
+                ..
+            } => {
+                assert!(required_bytes > rlimit_memlock_bytes);
+                assert_eq!(available_bytes, 100_000_000);
+                assert_eq!(rlimit_memlock_bytes, 500);
+            }
+            other => panic!("expected InsufficientLockableMemory, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_calculate_footprint_rejects_zero_n_ctx() {
+        let tensor_specs = [("weight", QuantType::F32, &[16][..])];
+        let bytes = create_synthetic_gguf_v3("synthetic", 32, &tensor_specs);
+        let model = GgufFile::parse(&bytes).expect("parse model");
+        let meta = model.metadata();
+
+        let err = calculate_footprint(meta, 0).expect_err("must reject zero n_ctx");
+        assert!(matches!(err, K3Error::CapabilityMismatch { .. }));
+    }
+
+    #[test]
+    fn test_calculate_footprint_rejects_n_ctx_exceeding_trained_limit() {
+        let tensor_specs = [("weight", QuantType::F32, &[16][..])];
+        let bytes = create_synthetic_gguf_v3("synthetic", 32, &tensor_specs);
+        let model = GgufFile::parse(&bytes).expect("parse model");
+        let meta = model.metadata();
+
+        // synthetic model trained context length in test helper is 2048
+        let err = calculate_footprint(meta, 4096).expect_err("must reject n_ctx > 2048");
+        assert_eq!(
+            err,
+            K3Error::ContextLengthExceeded {
+                requested_tokens: 4096,
+                max_context_tokens: 2048,
+            }
+        );
+    }
+}
