@@ -91,6 +91,8 @@ fn test_cli_us01_scenario_2_cluster_and_concurrency_targeting() {
         .arg("0x0001")
         .arg("--threads")
         .arg("1")
+        .arg("--n-ctx")
+        .arg("64")
         .arg("--max-tokens")
         .arg("3")
         .output()
@@ -116,6 +118,8 @@ fn test_cli_us01_scenario_2_cluster_and_concurrency_targeting() {
         .arg("0x0001")
         .arg("--threads")
         .arg("2")
+        .arg("--n-ctx")
+        .arg("64")
         .output()
         .expect("spawn k3-diag with invalid thread/core bound");
 

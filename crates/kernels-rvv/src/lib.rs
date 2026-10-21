@@ -220,6 +220,7 @@ pub fn dot_product_f32_vla_stripmined(a: &[f32], b: &[f32], vlen_bits: usize) ->
 /// `vle32.v`, `vfmul.vv`, `vfredusum.vs`) compatible with both `zvl256b` (`X100`) and `zvl1024b` (`A100`).
 #[cfg(target_arch = "riscv64")]
 #[must_use]
+#[allow(unused_assignments)]
 pub fn dot_product_f32_rvv(a: &[f32], b: &[f32]) -> f32 {
     let len = a.len().min(b.len());
     if len == 0 {
@@ -312,6 +313,7 @@ pub fn rmsnorm_scalar(
 /// Returns [`K3Error::TensorBoundsError`] if `output`, `input`, and `weight` lengths
 /// do not match or if the slice is empty.
 #[cfg(target_arch = "riscv64")]
+#[allow(unused_assignments)]
 pub fn rmsnorm_rvv(
     output: &mut [f32],
     input: &[f32],
