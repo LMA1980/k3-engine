@@ -16,8 +16,11 @@ k3-core = { workspace = true }
 kernels-rvv = { workspace = true, optional = true }
 libc = { workspace = true }
 
+[dev-dependencies]
+k3-tokenizer = { workspace = true }
+
 [features]
 default = ["arch-synthetic", "kernels-rvv"]
 # In-process architecture recipe and compute kernel feature gates (ADR-024)
 arch-synthetic = ["dep:arch-synthetic"]
-kernels-rvv = ["dep:kernels-rvv"]
+kernels-rvv = ["dep:kernels-rvv", "arch-synthetic?/with-kernels"]

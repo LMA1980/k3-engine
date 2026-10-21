@@ -4,12 +4,23 @@
 //! in-process via Cargo feature gates per ADR-024, targeting `riscv64gc-unknown-linux-gnu`
 //! with RVV 1.0 (`+v`) per ADR-029.
 
+pub mod affinity;
 pub mod capability;
+pub mod engine;
 pub mod kv;
 pub mod memory;
 pub mod weights;
 
+pub use affinity::{
+    A100_CLUSTER_MASK, A100_DEFAULT_MAX_COMPUTE_THREADS, ClusterPreset, CpuTopologyInspector,
+    MockCpuTopology, ResolvedAffinity, SystemCpuTopology, VlenDomain, WorkerAffinityStatus,
+    WorkerPool, X100_CLUSTER_MASK, X100_DEFAULT_MAX_COMPUTE_THREADS, parse_cpu_list_mask,
+    resolve_affinity, resolve_affinity_with,
+};
 pub use capability::{RecipeRegistry, verify_metadata_capabilities, verify_model_capabilities};
+pub use engine::{
+    EnginePhase, EvaluationSummary, SinglePromptEngine, StreamAction, sample_greedy_argmax,
+};
 pub use k3_core::{
     self, ArchRecipe, ExecutionContext, GgufFile, K3Error, ModelMetadata, ModelWeights, QuantType,
     TensorDescriptor, TensorView,

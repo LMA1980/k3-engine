@@ -38,6 +38,7 @@ steps:
       k3-tokenizer = { path = "k3-engine/crates/k3-tokenizer" }
       kernels-rvv = { path = "k3-engine/crates/kernels-rvv" }
       arch-synthetic = { path = "k3-engine/crates/arch-synthetic" }
+      libc = "0.2"
       
       [workspace.lints.rust]
       unsafe_op_in_unsafe_fn = "deny"

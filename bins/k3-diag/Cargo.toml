@@ -18,3 +18,4 @@ path = "src/main.rs"
 k3-core = { workspace = true }
 k3-engine = { workspace = true }
 k3-tokenizer = { workspace = true }
+libc = { workspace = true }

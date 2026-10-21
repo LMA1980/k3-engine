@@ -15,5 +15,5 @@ k3-core = { workspace = true }
 kernels-rvv = { workspace = true, optional = true }
 
 [features]
-default = []
+default = ["with-kernels"]
 with-kernels = ["dep:kernels-rvv"]

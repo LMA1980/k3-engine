@@ -1,12 +1,50 @@
 //! `k3-diag`: Operator diagnostic CLI binary.
 //!
 //! Provides a standalone zero-orchestration tool for verifying model correctness,
-//! core affinity, and tokenization behavior on `SpacemiT` K3 hardware.
+//! capability filtering, pre-flight memory admission, locked weight residency (`mlock` + `flock`),
+//! core affinity, in-process tokenization, and real-time unbuffered token streaming on
+//! `SpacemiT` K3 hardware (US-01, ADR-005, ADR-023, ADR-025, ADR-027, ADR-037, ADR-040).
 
 use std::env;
+use std::io::{self, Write};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use k3_core::K3Error;
+use k3_core::{GgufFile, K3Error};
+use k3_engine::{
+    LockedModelWeights, SinglePromptEngine, SingleSlotKvArena, StreamAction, SystemMemoryInspector,
+    WorkerPool, resolve_affinity,
+};
+use k3_tokenizer::{DetokenizeStep, GgufTokenizer};
+
+/// Global atomic flag set when `SIGINT` or `SIGTERM` is received so the decode loop
+/// exits cleanly and triggers RAII `Drop` guards (`munlock`, `munmap`, `flock(LOCK_UN)`).
+static ABORT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_termination_signal(_sig: libc::c_int) {
+    ABORT_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+fn install_signal_handlers() {
+    // SAFETY: handle_termination_signal is an async-signal-safe extern "C" function
+    // that only performs an atomic relaxed/seqcst store on a static AtomicBool.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            handle_termination_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            handle_termination_signal as *const () as libc::sighandler_t,
+        );
+    }
+}
+
+/// Returns `true` if an operator `SIGINT` or `SIGTERM` abort was requested.
+#[must_use]
+pub fn is_abort_requested() -> bool {
+    ABORT_REQUESTED.load(Ordering::SeqCst)
+}
 
 /// Command line arguments parsed for a diagnostic session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +71,7 @@ impl Default for DiagConfig {
             model_path: None,
             prompt: None,
             cluster: None,
-            threads: Some(1),
+            threads: None,
             core_mask: None,
             n_ctx: Some(2048),
             max_tokens: Some(128),
@@ -172,7 +210,105 @@ fn print_usage() {
     );
 }
 
+/// Executes the end-to-end standalone diagnostic evaluation pipeline (US-01.7.2):
+/// 1. Resolve cluster/core affinity & bind pinned worker pool (`US-01.5`).
+/// 2. Open GGUF model, verify capabilities, verify pre-flight RAM admission, and lock weights (`flock(LOCK_SH)` + `mmap` + `mlock`) (`US-01.2`, `US-01.3`).
+/// 3. Allocate and `mlock` single-slot KV cache arena (`US-01.3.3`).
+/// 4. Extract GGUF vocabulary & chat template, format prompt, and tokenize (`US-01.4`).
+/// 5. Execute isolated single-prompt forward pass and stream detokenized UTF-8 pieces to `stdout` (`US-01.6`, `US-01.7.2`).
+///
+/// # Errors
+///
+/// Returns [`K3Error`] if any pre-flight admission check, affinity binding, tokenization,
+/// or forward-pass step fails.
+pub fn run_diagnostic_session<W: Write>(config: &DiagConfig, mut out: W) -> Result<(), K3Error> {
+    let model_path = config
+        .model_path
+        .as_deref()
+        .ok_or_else(|| K3Error::CapabilityMismatch {
+            architecture: "cli".to_owned(),
+            reason: "missing required --model <path>".to_owned(),
+        })?;
+    let prompt_text = config.prompt.as_deref().unwrap_or("hello world");
+    let n_ctx = config.n_ctx.unwrap_or(2048);
+    let max_tokens = config.max_tokens.unwrap_or(128);
+
+    // 1. Resolve cluster & core affinity and spawn pinned worker pool (US-01.5, Scenario 2)
+    let resolved_affinity =
+        resolve_affinity(config.cluster.as_deref(), config.core_mask, config.threads)?;
+    let worker_pool = WorkerPool::new(resolved_affinity)?;
+    worker_pool.verify_live_affinities()?;
+
+    // 2. Open model with flock(LOCK_SH), GGUF parse, capability filter, pre-flight RAM admission, and mlock (US-01.2, US-01.3, Scenario 1 & 3)
+    let inspector = SystemMemoryInspector::new();
+    let (locked_weights, recipe, _footprint) =
+        LockedModelWeights::open_with_admission(model_path, n_ctx, &inspector)?;
+
+    // 3. Allocate and mlock single-slot 16-token paged KV cache arena (US-01.3.3)
+    let mut kv_arena = SingleSlotKvArena::new(locked_weights.metadata(), n_ctx)?;
+
+    // 4. Extract GGUF vocabulary/template and tokenize prompt in-process (US-01.4)
+    let gguf_view = GgufFile::parse(locked_weights.as_bytes())?;
+    let tokenizer = GgufTokenizer::from_gguf(&gguf_view)?;
+    let prompt_tokens = tokenizer.tokenize_prompt(prompt_text, true, n_ctx)?;
+
+    // 5. Execute isolated single-prompt forward pass and stream tokens unbuffered (US-01.6, US-01.7.2)
+    let mut engine = SinglePromptEngine::new();
+    let mut detokenizer = tokenizer.streaming_detokenizer();
+
+    engine.evaluate_prompt_with_pool(
+        recipe,
+        &locked_weights,
+        &mut kv_arena,
+        Some(&worker_pool),
+        &prompt_tokens,
+        tokenizer.vocab_size(),
+        max_tokens,
+        |token_id| {
+            if is_abort_requested() {
+                return Ok(StreamAction::Stop);
+            }
+
+            match detokenizer.push_token(token_id)? {
+                DetokenizeStep::Emit(piece) => {
+                    let _ = out.write_all(piece.as_bytes());
+                    let _ = out.flush();
+                    Ok(StreamAction::Continue)
+                }
+                DetokenizeStep::Hold => Ok(StreamAction::Continue),
+                DetokenizeStep::Stop(prefix) => {
+                    if !prefix.is_empty() {
+                        let _ = out.write_all(prefix.as_bytes());
+                        let _ = out.flush();
+                    }
+                    Ok(StreamAction::Stop)
+                }
+            }
+        },
+    )?;
+
+    if !detokenizer.is_stopped() && !is_abort_requested() {
+        let trailing = detokenizer.finish();
+        if !trailing.is_empty() {
+            let _ = out.write_all(trailing.as_bytes());
+            let _ = out.flush();
+        }
+    }
+
+    let _ = out.write_all(b"\n");
+    let _ = out.flush();
+
+    // Re-verify worker affinities before teardown to guarantee zero cross-cluster drift during evaluation
+    worker_pool.verify_live_affinities()?;
+
+    // RAII Drop guards for `kv_arena`, `locked_weights`, and `worker_pool` execute deterministically here,
+    // releasing mlock, munmap, and flock(LOCK_UN).
+    Ok(())
+}
+
 fn main() -> ExitCode {
+    install_signal_handlers();
+
     let args = env::args();
     let config = match DiagConfig::parse_args(args) {
         Ok(Some(cfg)) => cfg,
@@ -190,12 +326,11 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    // Diagnostic run execution stub: wires k3-engine and k3-tokenizer
-    println!(
-        "k3-diag: initialized session (model: {}, threads: {})",
-        config.model_path.as_deref().unwrap_or(""),
-        config.threads.unwrap_or(1)
-    );
+    let stdout = io::stdout();
+    if let Err(err) = run_diagnostic_session(&config, stdout) {
+        eprintln!("{err}");
+        return ExitCode::from(exit_code_for_error(&err));
+    }
 
     ExitCode::SUCCESS
 }
@@ -203,6 +338,9 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k3_core::QuantType;
+    use k3_core::test_helpers::create_synthetic_gguf_v3;
+    use std::fs::File;
 
     #[test]
     fn test_parse_args_valid_options() {
@@ -294,5 +432,37 @@ mod tests {
             reason: "oob".to_owned(),
         };
         assert_eq!(exit_code_for_error(&bounds_err), 14);
+    }
+
+    #[test]
+    fn test_run_diagnostic_session_streams_tokens_end_to_end() {
+        let tensor_specs = [
+            ("blk.0.attn_q.weight", QuantType::Q4_K_M, &[256, 2][..]),
+            ("output_norm.weight", QuantType::F32, &[16][..]),
+        ];
+        let bytes = create_synthetic_gguf_v3("synthetic", 32, &tensor_specs);
+        let temp_path = env::temp_dir().join(format!("k3_diag_unit_{}.gguf", std::process::id()));
+        {
+            let mut f = File::create(&temp_path).expect("create temp gguf");
+            f.write_all(&bytes).expect("write gguf");
+            f.sync_all().expect("sync gguf");
+        }
+
+        let cfg = DiagConfig {
+            model_path: Some(temp_path.to_string_lossy().into_owned()),
+            prompt: Some("hello world".to_owned()),
+            cluster: None,
+            threads: Some(1),
+            core_mask: Some(0x0001),
+            n_ctx: Some(64),
+            max_tokens: Some(4),
+        };
+
+        let mut output_buf = Vec::new();
+        run_diagnostic_session(&cfg, &mut output_buf).expect("run diagnostic session");
+        let output_str = String::from_utf8(output_buf).expect("valid utf8 output");
+        assert_eq!(output_str.trim(), "helloworldExplainRVV");
+
+        let _ = std::fs::remove_file(&temp_path);
     }
 }

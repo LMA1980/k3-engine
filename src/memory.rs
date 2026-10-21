@@ -195,6 +195,12 @@ impl SystemMemoryInspector {
 
 impl MemoryInspector for SystemMemoryInspector {
     fn available_memory_bytes(&self) -> Result<u64, K3Error> {
+        if let Ok(val) = std::env::var("K3_AVAILABLE_RAM_BYTES") {
+            if let Ok(parsed) = val.trim().parse::<u64>() {
+                return Ok(parsed);
+            }
+        }
+
         let file = fs::File::open("/proc/meminfo").map_err(|_err| {
             K3Error::InsufficientLockableMemory {
                 required_bytes: 0,
@@ -247,6 +253,12 @@ impl MemoryInspector for SystemMemoryInspector {
     }
 
     fn rlimit_memlock_bytes(&self) -> Result<u64, K3Error> {
+        if let Ok(val) = std::env::var("K3_RLIMIT_MEMLOCK_BYTES") {
+            if let Ok(parsed) = val.trim().parse::<u64>() {
+                return Ok(parsed);
+            }
+        }
+
         let mut rlim = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
