@@ -1,0 +1,71 @@
+version: "1"
+name: "k3-engine Pull Request Verification Pipeline"
+
+env:
+  CARGO_TERM_COLOR: always
+
+steps:
+  - name: "Synchronize Dependencies & Workspace Bridge"
+    run: |
+      mkdir -p ..
+      if [ ! -d "../k3-core/.git" ]; then
+        git clone https://github.com/LMA1980/k3-core.git ../k3-core
+      else
+        git -C ../k3-core pull origin main || true
+      fi
+      
+      cat << "EOF" > ../Cargo.toml
+      [workspace]
+      resolver = "2"
+      members = [
+          "k3-core",
+          "k3-engine",
+          "k3-engine/bins/k3-diag",
+          "k3-engine/crates/arch-synthetic",
+          "k3-engine/crates/k3-tokenizer",
+          "k3-engine/crates/kernels-rvv",
+      ]
+      
+      [workspace.package]
+      version = "0.1.0"
+      edition = "2024"
+      rust-version = "1.85"
+      license = "Apache-2.0"
+      
+      [workspace.dependencies]
+      k3-core = { path = "k3-core" }
+      k3-engine = { path = "k3-engine" }
+      k3-tokenizer = { path = "k3-engine/crates/k3-tokenizer" }
+      kernels-rvv = { path = "k3-engine/crates/kernels-rvv" }
+      arch-synthetic = { path = "k3-engine/crates/arch-synthetic" }
+      
+      [workspace.lints.rust]
+      unsafe_op_in_unsafe_fn = "deny"
+      missing_debug_implementations = "warn"
+      unreachable_pub = "warn"
+      unused_qualifications = "warn"
+      
+      [workspace.lints.clippy]
+      all = { level = "warn", priority = -1 }
+      pedantic = { level = "warn", priority = -1 }
+      undocumented_unsafe_blocks = "warn"
+      EOF
+      
+      cargo generate-lockfile --manifest-path ../Cargo.toml || true
+    timeout_seconds: 180
+
+  - name: "Verify Rust Formatting (cargo fmt)"
+    run: "cargo fmt --check"
+    timeout_seconds: 120
+
+  - name: "Verify Rust Linter & Clippy Rules (cargo clippy)"
+    run: "cargo clippy --package k3-engine --package k3-diag --package arch-synthetic --package k3-tokenizer --package kernels-rvv --all-targets -- -D warnings"
+    timeout_seconds: 300
+
+  - name: "Verify Dependencies Security Advisories (cargo audit)"
+    run: "cargo audit --file ../Cargo.lock"
+    timeout_seconds: 180
+
+  - name: "Evaluate Test Suite & Line Code Coverage (cargo llvm-cov)"
+    run: "cargo llvm-cov --package k3-engine --package arch-synthetic --package k3-tokenizer --package kernels-rvv --summary-only"
+    timeout_seconds: 300
