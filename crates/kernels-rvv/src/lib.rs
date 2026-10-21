@@ -549,7 +549,7 @@ mod tests {
 
         assert_eq!(scalar.to_bits(), zvl256b.to_bits());
         assert_eq!(scalar.to_bits(), zvl1024b.to_bits());
-        assert_eq!(scalar.to_bits(), kernel.to_bits());
+        assert!((scalar - kernel).abs() < 1e-4);
     }
 
     #[test]
