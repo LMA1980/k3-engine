@@ -7,6 +7,8 @@
 pub mod affinity;
 pub mod capability;
 pub mod engine;
+#[cfg(feature = "kernels-rvv")]
+pub mod forward;
 pub mod kv;
 pub mod memory;
 pub mod weights;

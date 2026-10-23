@@ -213,7 +213,11 @@ impl SinglePromptEngine {
     /// - Returns [`K3Error::CapabilityMismatch`] if another prompt is already active (ADR-005)
     ///   or if `prompt_tokens` / `vocab_size` is empty.
     /// - Returns [`K3Error::ContextLengthExceeded`] if `prompt_tokens.len() > kv_arena.n_ctx()`.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cast_precision_loss)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::cast_precision_loss
+    )]
     pub fn evaluate_prompt_with_pool<F>(
         &mut self,
         recipe: &dyn ArchRecipe,
@@ -373,7 +377,7 @@ impl SinglePromptEngine {
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn compute_pass_timing(
+pub(crate) fn compute_pass_timing(
     pass_start: Instant,
     ttft_ms: f64,
     prefill_ms: f64,
@@ -471,9 +475,9 @@ mod tests {
         assert!(summary.timing.total_wall_time_ms >= summary.timing.ttft_ms);
         assert_eq!(summary.timing.decode_steps, 3);
         assert!(summary.timing.decode_tokens_per_sec >= 0.0);
-        assert_eq!(summary.timing.cumulative_barrier_wait_ms, 0.0);
-        assert_eq!(summary.timing.barrier_wait_ratio, 0.0);
-        assert_eq!(summary.timing.compute_utilization_ratio, 1.0);
+        assert!(summary.timing.cumulative_barrier_wait_ms.abs() <= f64::EPSILON);
+        assert!(summary.timing.barrier_wait_ratio.abs() <= f64::EPSILON);
+        assert!((summary.timing.compute_utilization_ratio - 1.0).abs() <= f64::EPSILON);
     }
 
     #[cfg(feature = "arch-synthetic")]
@@ -499,7 +503,7 @@ mod tests {
             .expect("eval 0");
         assert_eq!(summary_0.generated_tokens.len(), 0);
         assert_eq!(summary_0.timing.decode_steps, 0);
-        assert_eq!(summary_0.timing.decode_tokens_per_sec, 0.0);
+        assert!(summary_0.timing.decode_tokens_per_sec.abs() <= f64::EPSILON);
         assert!(summary_0.timing.ttft_ms >= 0.0);
 
         // 2. max_tokens = 1 (prefill + first token sample, zero decode steps)
@@ -511,13 +515,13 @@ mod tests {
             .expect("eval 1");
         assert_eq!(summary_1.generated_tokens.len(), 1);
         assert_eq!(summary_1.timing.decode_steps, 0);
-        assert_eq!(summary_1.timing.decode_tokens_per_sec, 0.0);
+        assert!(summary_1.timing.decode_tokens_per_sec.abs() <= f64::EPSILON);
         assert!(summary_1.timing.ttft_ms >= 0.0);
 
         // 3. PassTiming zero and default
         let zero_timing = PassTiming::zero();
         assert_eq!(zero_timing, PassTiming::default());
-        assert_eq!(zero_timing.compute_utilization_ratio, 1.0);
+        assert!((zero_timing.compute_utilization_ratio - 1.0).abs() <= f64::EPSILON);
     }
 
     #[test]

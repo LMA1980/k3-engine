@@ -4,7 +4,7 @@
 //! capability filtering, pre-flight memory admission, locked weight residency (`mlock` + `flock`),
 //! core affinity, multi-core coordination profiles (`spin`, `futex`, `rayon`), multi-run jitter
 //! benchmarking, in-process tokenization, and real-time unbuffered token streaming on
-//! `SpacemiT` K3 hardware (US-01, US-02, ADR-005, ADR-006, ADR-007, ADR-010, ADR-023, ADR-025, ADR-027, ADR-037, ADR-040).
+//! `SpacemiT` K3 hardware (US-01, US-02, US-03 cluster splitting and IME benchmarking, ADR-005, ADR-006, ADR-007, ADR-010, ADR-023, ADR-025, ADR-027, ADR-037, ADR-040).
 
 #![allow(
     clippy::pedantic,
@@ -15,12 +15,15 @@
     clippy::missing_errors_doc
 )]
 
+mod bench;
+
 use std::env;
 use std::io::{self, Write};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use k3_core::{CoordinationProfile, GgufFile, K3Error};
+use k3_engine::affinity::SplitStrategy;
 use k3_engine::{
     LockedModelWeights, SinglePromptEngine, SingleSlotKvArena, StreamAction, SystemMemoryInspector,
     WorkerPool, resolve_affinity,
@@ -64,8 +67,12 @@ pub struct DiagConfig {
     pub model_path: Option<String>,
     /// Input prompt to evaluate.
     pub prompt: Option<String>,
-    /// Target processor cluster ("x100" or "a100").
+    /// Target processor cluster ("both", "x100" or "a100").
     pub cluster: Option<String>,
+    /// Cross-cluster workload split policy, valid only with `--cluster both` (US-03).
+    pub split: Option<SplitStrategy>,
+    /// SpacemiT IME matrix acceleration toggle (`Some(true)` = `on`, US-03).
+    pub ime: Option<bool>,
     /// Worker thread count.
     pub threads: Option<usize>,
     /// Bitmask for pinned core affinity.
@@ -88,6 +95,8 @@ impl Default for DiagConfig {
             model_path: None,
             prompt: None,
             cluster: None,
+            split: None,
+            ime: None,
             threads: None,
             core_mask: None,
             n_ctx: Some(64),
@@ -139,13 +148,42 @@ impl DiagConfig {
                 "--cluster" => {
                     let cluster = args
                         .next()
-                        .ok_or_else(|| "--cluster requires 'x100' or 'a100'".to_owned())?;
-                    if cluster != "x100" && cluster != "a100" {
+                        .ok_or_else(|| "--cluster requires 'both', 'x100' or 'a100'".to_owned())?;
+                    if cluster != "x100" && cluster != "a100" && cluster != "both" {
                         return Err(format!(
-                            "invalid cluster '{cluster}': expected 'x100' or 'a100'"
+                            "invalid cluster '{cluster}': expected 'both', 'x100' or 'a100'"
                         ));
                     }
                     config.cluster = Some(cluster);
+                }
+                "--split" => {
+                    let val = args
+                        .next()
+                        .ok_or_else(|| "--split requires 'phase', 'op' or 'row'".to_owned())?;
+                    config.split = Some(match val.as_str() {
+                        "phase" => SplitStrategy::Phase,
+                        "op" => SplitStrategy::Op,
+                        "row" => SplitStrategy::Row,
+                        _ => {
+                            return Err(format!(
+                                "invalid split strategy '{val}': expected 'phase', 'op' or 'row'"
+                            ));
+                        }
+                    });
+                }
+                "--ime" => {
+                    let val = args
+                        .next()
+                        .ok_or_else(|| "--ime requires 'on' or 'off'".to_owned())?;
+                    config.ime = Some(match val.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        _ => {
+                            return Err(format!(
+                                "invalid IME toggle '{val}': expected 'on' or 'off'"
+                            ));
+                        }
+                    });
                 }
                 "--threads" | "-t" => {
                     let val = args
@@ -203,9 +241,9 @@ impl DiagConfig {
                     config.coord = Some(profile);
                 }
                 "--repeat" => {
-                    let val = args
-                        .next()
-                        .ok_or_else(|| "--repeat requires an integer count of at least 3".to_owned())?;
+                    let val = args.next().ok_or_else(|| {
+                        "--repeat requires an integer count of at least 3".to_owned()
+                    })?;
                     let n = val.parse::<isize>().map_err(|_| {
                         format!("invalid repeat count '{val}': expected integer of at least 3")
                     })?;
@@ -225,7 +263,28 @@ impl DiagConfig {
             }
         }
 
+        // Cluster-boundary rules (US-03): a mixed-cluster mask is allowed only through an
+        // explicit split policy, and a split policy only makes sense across both clusters.
+        if config.split.is_some() && config.cluster.as_deref() != Some("both") {
+            return Err("--split requires --cluster both".to_owned());
+        }
+        if config.cluster.as_deref() == Some("both") && config.split.is_none() {
+            return Err(
+                "--cluster both requires an explicit --split <phase|op|row> policy".to_owned(),
+            );
+        }
+
         Ok(Some(config))
+    }
+
+    /// Returns `true` when the US-03 matrix-forward benchmark (cluster placement, split and IME
+    /// comparison) should run instead of the US-01/US-02 recipe evaluation.
+    #[must_use]
+    pub fn is_matrix_benchmark(&self) -> bool {
+        self.split.is_some()
+            || self.ime.is_some()
+            || self.cluster.as_deref() == Some("both")
+            || (self.cluster.is_some() && self.json)
     }
 }
 
@@ -331,7 +390,9 @@ fn print_usage() {
          Options:\n  \
            -m, --model <path>     Path to local model file (GGUF)\n  \
            -p, --prompt <text>    Input prompt to tokenize and evaluate\n  \
-               --cluster <id>     Target processor cluster ('x100' or 'a100')\n  \
+               --cluster <id>     Target processor cluster ('both', 'x100' or 'a100')\n  \
+               --split <policy>   Cross-cluster split for '--cluster both' ('phase', 'op', 'row')\n  \
+               --ime <on|off>     SpacemiT IME matrix acceleration ('on' also measures the 'off' baseline)\n  \
            -t, --threads <n>      Number of execution worker threads\n  \
                --cores <mask>     Pinned core affinity mask (e.g. 0x00FF)\n  \
                --n-ctx <tokens>   Configured context sequence length (default: 2048)\n  \
@@ -439,10 +500,19 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
 
     // 7. Calculate Descriptive Statistics
     let ttft_samples: Vec<f64> = run_metrics.iter().map(|r| r.ttft_ms).collect();
-    let throughput_samples: Vec<f64> = run_metrics.iter().map(|r| r.decode_tokens_per_sec).collect();
-    let barrier_samples: Vec<f64> = run_metrics.iter().map(|r| r.cumulative_barrier_wait_ms).collect();
+    let throughput_samples: Vec<f64> = run_metrics
+        .iter()
+        .map(|r| r.decode_tokens_per_sec)
+        .collect();
+    let barrier_samples: Vec<f64> = run_metrics
+        .iter()
+        .map(|r| r.cumulative_barrier_wait_ms)
+        .collect();
     let wall_time_samples: Vec<f64> = run_metrics.iter().map(|r| r.total_wall_time_ms).collect();
-    let util_samples: Vec<f64> = run_metrics.iter().map(|r| r.compute_utilization_ratio).collect();
+    let util_samples: Vec<f64> = run_metrics
+        .iter()
+        .map(|r| r.compute_utilization_ratio)
+        .collect();
 
     let statistics = StatisticsSummary {
         ttft_ms: MetricStats::calculate(&ttft_samples),
@@ -464,15 +534,25 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
             runs: run_metrics,
             statistics,
         };
-        let json_str = serde_json::to_string_pretty(&report).map_err(|e| K3Error::CapabilityMismatch {
-            architecture: "json".to_owned(),
-            reason: e.to_string(),
-        })?;
+        let json_str =
+            serde_json::to_string_pretty(&report).map_err(|e| K3Error::CapabilityMismatch {
+                architecture: "json".to_owned(),
+                reason: e.to_string(),
+            })?;
         let _ = writeln!(out, "{json_str}");
     } else {
-        let _ = writeln!(out, "==========================================================");
-        let _ = writeln!(out, " k3-diag: Multi-Core Synchronization & Jitter Benchmark");
-        let _ = writeln!(out, "==========================================================");
+        let _ = writeln!(
+            out,
+            "=========================================================="
+        );
+        let _ = writeln!(
+            out,
+            " k3-diag: Multi-Core Synchronization & Jitter Benchmark"
+        );
+        let _ = writeln!(
+            out,
+            "=========================================================="
+        );
         let _ = writeln!(out, "Coordination Profile : {}", profile.as_str());
         let _ = writeln!(out, "Repeat Iterations    : {}", run_metrics.len());
         let _ = writeln!(out, "Worker Threads       : {thread_count}");
@@ -486,9 +566,15 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
                 "MISMATCH"
             }
         );
-        let _ = writeln!(out, "----------------------------------------------------------");
+        let _ = writeln!(
+            out,
+            "----------------------------------------------------------"
+        );
         let _ = writeln!(out, "Iteration Breakdown:");
-        let _ = writeln!(out, "  Run | TTFT (ms) | Decode (tokens/s) | Barrier Wait (ms) | Total Wall (ms)");
+        let _ = writeln!(
+            out,
+            "  Run | TTFT (ms) | Decode (tokens/s) | Barrier Wait (ms) | Total Wall (ms)"
+        );
         for r in &run_metrics {
             let _ = writeln!(
                 out,
@@ -500,13 +586,22 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
                 r.total_wall_time_ms
             );
         }
-        let _ = writeln!(out, "----------------------------------------------------------");
+        let _ = writeln!(
+            out,
+            "----------------------------------------------------------"
+        );
         let _ = writeln!(out, "Statistical Jitter Summary (Mean, Min, Max, StdDev):");
-        let _ = writeln!(out, "  Metric                      |      Mean |       Min |       Max |    StdDev");
+        let _ = writeln!(
+            out,
+            "  Metric                      |      Mean |       Min |       Max |    StdDev"
+        );
         let _ = writeln!(
             out,
             "  TTFT (Time to First Token)  | {:9.2} | {:9.2} | {:9.2} | {:9.2}",
-            statistics.ttft_ms.mean, statistics.ttft_ms.min, statistics.ttft_ms.max, statistics.ttft_ms.stddev
+            statistics.ttft_ms.mean,
+            statistics.ttft_ms.min,
+            statistics.ttft_ms.max,
+            statistics.ttft_ms.stddev
         );
         let _ = writeln!(
             out,
@@ -540,7 +635,10 @@ pub fn run_multi_run_benchmark<W: Write>(config: &DiagConfig, mut out: W) -> Res
             statistics.compute_utilization_ratio.max,
             statistics.compute_utilization_ratio.stddev
         );
-        let _ = writeln!(out, "==========================================================");
+        let _ = writeln!(
+            out,
+            "=========================================================="
+        );
     }
     let _ = out.flush();
 
@@ -637,7 +735,9 @@ pub fn run_single_eval_session<W: Write>(config: &DiagConfig, mut out: W) -> Res
 /// Executes diagnostic session dispatcher: routes to multi-run benchmark if `--repeat` is specified,
 /// or single-eval streaming pipeline if `--repeat` is absent.
 pub fn run_diagnostic_session<W: Write>(config: &DiagConfig, out: W) -> Result<(), K3Error> {
-    if config.repeat.is_some() {
+    if config.is_matrix_benchmark() {
+        bench::run_matrix_benchmark(config, out)
+    } else if config.repeat.is_some() {
         run_multi_run_benchmark(config, out)
     } else {
         run_single_eval_session(config, out)
@@ -831,6 +931,8 @@ mod tests {
             model_path: Some(temp_path.to_string_lossy().into_owned()),
             prompt: Some("hello world".to_owned()),
             cluster: None,
+            split: None,
+            ime: None,
             threads: Some(1),
             core_mask: Some(0x0001),
             n_ctx: Some(64),
@@ -855,7 +957,8 @@ mod tests {
             ("output_norm.weight", QuantType::F32, &[16][..]),
         ];
         let bytes = create_synthetic_gguf_v3("synthetic", 32, &tensor_specs);
-        let temp_path = env::temp_dir().join(format!("k3_diag_unit_multirun_{}.gguf", std::process::id()));
+        let temp_path =
+            env::temp_dir().join(format!("k3_diag_unit_multirun_{}.gguf", std::process::id()));
         {
             let mut f = File::create(&temp_path).expect("create temp gguf");
             f.write_all(&bytes).expect("write gguf");
@@ -866,6 +969,8 @@ mod tests {
             model_path: Some(temp_path.to_string_lossy().into_owned()),
             prompt: Some("hello world".to_owned()),
             cluster: None,
+            split: None,
+            ime: None,
             threads: Some(1),
             core_mask: Some(0x0001),
             n_ctx: Some(64),
@@ -878,7 +983,8 @@ mod tests {
         let mut output_buf = Vec::new();
         run_diagnostic_session(&cfg, &mut output_buf).expect("run multi-run benchmark");
         let output_str = String::from_utf8(output_buf).expect("valid utf8 output");
-        let report: MultiRunReport = serde_json::from_str(&output_str).expect("parse multi-run report JSON");
+        let report: MultiRunReport =
+            serde_json::from_str(&output_str).expect("parse multi-run report JSON");
 
         assert_eq!(report.coordination_profile, "spin");
         assert_eq!(report.repeat_count, 3);

@@ -7,6 +7,8 @@
 
 use k3_core::{K3Error, QuantType, TensorView};
 
+pub mod ime;
+
 /// Number of scalar elements per `Q4_K_M` super-block.
 pub const Q4_K_M_BLOCK_ELEMENTS: usize = 256;
 

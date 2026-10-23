@@ -11,6 +11,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use k3_core::{CoordinationProfile, K3Error};
+use serde::{Deserialize, Serialize};
 
 /// Core bitmask for Cluster 0 (`X100` `OoO` cores 0–7, `zvl256b`).
 pub const X100_CLUSTER_MASK: u64 = 0x00FF;
@@ -31,6 +32,8 @@ pub enum VlenDomain {
     Zvl256b,
     /// 1024-bit vector registers (`zvl1024b`) on `A100` cores 8–15.
     Zvl1024b,
+    /// Heterogeneous dual-cluster configuration with partitioned VLEN domains.
+    Heterogeneous,
 }
 
 impl VlenDomain {
@@ -40,12 +43,13 @@ impl VlenDomain {
         match self {
             Self::Zvl256b => "zvl256b",
             Self::Zvl1024b => "zvl1024b",
+            Self::Heterogeneous => "heterogeneous",
         }
     }
 }
 
 /// Named processor cluster presets on the `SpacemiT` K3 `SoC`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClusterPreset {
     /// Cluster 0: `X100` cores 0–7 (`0x00FF`, `zvl256b`, default max 6 compute threads per ADR-007).
     X100,
@@ -104,6 +108,124 @@ impl ClusterPreset {
         match self {
             Self::X100 => X100_DEFAULT_MAX_COMPUTE_THREADS,
             Self::A100 => A100_DEFAULT_MAX_COMPUTE_THREADS,
+        }
+    }
+}
+
+/// Cross-cluster workload distribution strategy (US-03 R1, ADR-009).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SplitStrategy {
+    /// Prefill on one cluster, token decode on another.
+    Phase,
+    /// Matrix operations on A100 (IME), Attention/Norm on X100 (`OoO`).
+    Op,
+    /// Concurrent row partitioning proportional to measured cluster throughput.
+    Row,
+}
+
+impl SplitStrategy {
+    /// Parses a split strategy string ("phase", "op", "row").
+    ///
+    /// # Errors
+    /// Returns [`K3Error::AffinityError`] if `name` is unrecognized.
+    pub fn parse(name: &str, requested_threads: usize) -> Result<Self, K3Error> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "phase" => Ok(Self::Phase),
+            "op" => Ok(Self::Op),
+            "row" => Ok(Self::Row),
+            other => Err(K3Error::AffinityError {
+                requested_mask: 0,
+                requested_threads,
+                reason: format!(
+                    "unknown split strategy '{other}'; expected 'phase', 'op', or 'row'"
+                ),
+            }),
+        }
+    }
+
+    /// Returns canonical string representation.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Phase => "phase",
+            Self::Op => "op",
+            Self::Row => "row",
+        }
+    }
+}
+
+/// Target processor cluster placement and split strategy configuration (US-03 R1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClusterSelection {
+    /// Dedicated placement on a single cluster (`x100` or `a100`).
+    Single(ClusterPreset),
+    /// Dual-cluster allocation partitioned across both `X100` and `A100` with an explicit split policy.
+    Both { split: SplitStrategy },
+}
+
+impl ClusterSelection {
+    /// Parses cluster selection from cluster name and optional split strategy.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::AffinityError`] if:
+    /// - `cluster` is "both" without an explicit `split`.
+    /// - `cluster` is "x100" or "a100" with an unexpected `split`.
+    /// - `cluster` or `split` strings are unknown.
+    pub fn parse(
+        cluster: Option<&str>,
+        split: Option<&str>,
+        requested_threads: usize,
+    ) -> Result<Option<Self>, K3Error> {
+        match (cluster, split) {
+            (None, None) => Ok(None),
+            (Some("x100"), None) => Ok(Some(Self::Single(ClusterPreset::X100))),
+            (Some("a100"), None) => Ok(Some(Self::Single(ClusterPreset::A100))),
+            (Some("both"), Some(s)) => {
+                let strategy = SplitStrategy::parse(s, requested_threads)?;
+                Ok(Some(Self::Both { split: strategy }))
+            }
+            (Some("both"), None) => Err(K3Error::AffinityError {
+                requested_mask: 0,
+                requested_threads,
+                reason: "--cluster both requires an explicit --split <phase|op|row> policy"
+                    .to_owned(),
+            }),
+            (Some(c), Some(_)) if c == "x100" || c == "a100" => Err(K3Error::AffinityError {
+                requested_mask: 0,
+                requested_threads,
+                reason: format!(
+                    "--split policy is only valid with '--cluster both', but '--cluster {c}' was requested"
+                ),
+            }),
+            (None, Some(_)) => Err(K3Error::AffinityError {
+                requested_mask: 0,
+                requested_threads,
+                reason: "--split policy requires '--cluster both'".to_owned(),
+            }),
+            (Some(other), _) => Err(K3Error::AffinityError {
+                requested_mask: 0,
+                requested_threads,
+                reason: format!(
+                    "unknown cluster preset '{other}'; expected 'both', 'x100', or 'a100'"
+                ),
+            }),
+        }
+    }
+
+    /// Returns `true` if this selection is dual-cluster.
+    #[must_use]
+    pub const fn is_both(&self) -> bool {
+        matches!(self, Self::Both { .. })
+    }
+
+    /// Returns split strategy if dual-cluster.
+    #[must_use]
+    pub const fn split_strategy(&self) -> Option<SplitStrategy> {
+        match self {
+            Self::Both { split } => Some(*split),
+            Self::Single(_) => None,
         }
     }
 }
@@ -265,12 +387,14 @@ pub fn parse_cpu_list_mask(list_str: &str) -> Result<u64, K3Error> {
     Ok(mask)
 }
 
-/// Validated compute cluster, core bitmask, VLEN domain, and ordered core assignments (US-01.5.1).
+/// Validated compute cluster, core bitmask, VLEN domain, and ordered core assignments (US-01.5.1, US-03 R1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedAffinity {
-    /// Target cluster preset, if selected or inferred.
+    /// Target cluster preset, if single-cluster selected or inferred.
     pub cluster: Option<ClusterPreset>,
-    /// Active hardware VLEN domain (`zvl256b` or `zvl1024b`).
+    /// Target cluster selection (Single preset or Both with split strategy).
+    pub selection: Option<ClusterSelection>,
+    /// Active hardware VLEN domain (`zvl256b`, `zvl1024b`, or `Heterogeneous`).
     pub vlen_domain: VlenDomain,
     /// Effective core bitmask intersected with online CPUs.
     pub effective_mask: u64,
@@ -278,6 +402,28 @@ pub struct ResolvedAffinity {
     pub threads: usize,
     /// Exact 1-to-1 physical core IDs assigned to each worker thread (`len == threads`).
     pub assigned_cores: Vec<usize>,
+    /// Exact core IDs assigned to X100 workers (cores 0-7).
+    pub x100_cores: Vec<usize>,
+    /// Exact core IDs assigned to A100 workers (cores 8-15).
+    pub a100_cores: Vec<usize>,
+}
+
+impl ResolvedAffinity {
+    /// Returns `true` if this resolved configuration spans both clusters.
+    #[must_use]
+    pub fn is_dual_cluster(&self) -> bool {
+        self.selection
+            .as_ref()
+            .is_some_and(ClusterSelection::is_both)
+    }
+
+    /// Returns the split strategy if this configuration is dual-cluster.
+    #[must_use]
+    pub fn split_strategy(&self) -> Option<SplitStrategy> {
+        self.selection
+            .as_ref()
+            .and_then(ClusterSelection::split_strategy)
+    }
 }
 
 /// Resolves and validates requested `--cluster`, `--cores`, and `--threads` against the live system
@@ -304,17 +450,85 @@ pub fn resolve_affinity(
 ///
 /// # Errors
 ///
-/// Returns [`K3Error::AffinityError`] if:
-/// - `requested_threads` is `Some(0)`.
-/// - `explicit_mask` is `Some(0)`.
-/// - A single-cluster run mixes incompatible `X100` (`0x00FF`, `zvl256b`) and `A100` (`0xFF00`, `zvl1024b`)
-///   VLEN domains without an explicit cross-cluster split policy.
-/// - `--cluster` and `--cores` conflict (e.g., `--cluster x100` with cores outside `0x00FF`).
-/// - `--cluster x100` (without explicit `--cores` override) requests more than 6 compute threads (ADR-007).
-/// - `threads` exceeds the number of online cores in the resolved mask.
-#[allow(clippy::too_many_lines, clippy::similar_names)]
+/// Returns [`K3Error::AffinityError`] if configuration is invalid or constraints are violated.
 pub fn resolve_affinity_with<T: CpuTopologyInspector>(
     cluster: Option<&str>,
+    explicit_mask: Option<u64>,
+    requested_threads: Option<usize>,
+    topology: &T,
+) -> Result<ResolvedAffinity, K3Error> {
+    let req_threads = requested_threads.unwrap_or(1);
+    let selection = ClusterSelection::parse(cluster, None, req_threads)?;
+    resolve_cluster_affinity_with(selection, explicit_mask, requested_threads, topology)
+}
+
+/// Resolves and validates requested `--cluster`, `--split`, `--cores`, and `--threads` against the
+/// live system CPU topology (US-03 R1).
+///
+/// # Errors
+///
+/// Returns [`K3Error::AffinityError`] if configuration is invalid or constraints are violated.
+pub fn resolve_affinity_split(
+    cluster: Option<&str>,
+    split: Option<&str>,
+    explicit_mask: Option<u64>,
+    requested_threads: Option<usize>,
+) -> Result<ResolvedAffinity, K3Error> {
+    resolve_affinity_split_with(
+        cluster,
+        split,
+        explicit_mask,
+        requested_threads,
+        &SystemCpuTopology::new(),
+    )
+}
+
+/// Resolves and validates requested `--cluster`, `--split`, `--cores`, and `--threads` against a
+/// provided [`CpuTopologyInspector`] (US-03 R1).
+///
+/// # Errors
+///
+/// Returns [`K3Error::AffinityError`] if configuration is invalid or constraints are violated.
+pub fn resolve_affinity_split_with<T: CpuTopologyInspector>(
+    cluster: Option<&str>,
+    split: Option<&str>,
+    explicit_mask: Option<u64>,
+    requested_threads: Option<usize>,
+    topology: &T,
+) -> Result<ResolvedAffinity, K3Error> {
+    let req_threads = requested_threads.unwrap_or(1);
+    let selection = ClusterSelection::parse(cluster, split, req_threads)?;
+    resolve_cluster_affinity_with(selection, explicit_mask, requested_threads, topology)
+}
+
+/// Resolves and validates a [`ClusterSelection`] against live system CPU topology.
+///
+/// # Errors
+///
+/// Returns [`K3Error::AffinityError`] if configuration is invalid or constraints are violated.
+pub fn resolve_cluster_affinity(
+    selection: Option<ClusterSelection>,
+    explicit_mask: Option<u64>,
+    requested_threads: Option<usize>,
+) -> Result<ResolvedAffinity, K3Error> {
+    resolve_cluster_affinity_with(
+        selection,
+        explicit_mask,
+        requested_threads,
+        &SystemCpuTopology::new(),
+    )
+}
+
+/// Resolves and validates a [`ClusterSelection`], core bitmask, and thread count against a
+/// [`CpuTopologyInspector`] (US-01, US-02, US-03).
+///
+/// # Errors
+///
+/// Returns [`K3Error::AffinityError`] if configuration is invalid, cores are offline, or
+/// cluster isolation is violated.
+#[allow(clippy::too_many_lines, clippy::similar_names)]
+pub fn resolve_cluster_affinity_with<T: CpuTopologyInspector>(
+    selection: Option<ClusterSelection>,
     explicit_mask: Option<u64>,
     requested_threads: Option<usize>,
     topology: &T,
@@ -338,15 +552,10 @@ pub fn resolve_affinity_with<T: CpuTopologyInspector>(
         });
     }
 
-    let preset = match cluster {
-        Some(name) => Some(ClusterPreset::parse(name, req_threads_for_err)?),
-        None => None,
-    };
+    let is_dual = selection.as_ref().is_some_and(ClusterSelection::is_both);
 
-    // Determine candidate mask before online intersection
-    let candidate_mask = match (preset, explicit_mask) {
-        (Some(p), Some(mask)) => {
-            // Verify explicit mask is strictly within the requested cluster preset mask
+    let candidate_mask = match (&selection, explicit_mask) {
+        (Some(ClusterSelection::Single(p)), Some(mask)) => {
             if (mask & !p.core_mask()) != 0 {
                 return Err(K3Error::AffinityError {
                     requested_mask: mask,
@@ -360,18 +569,41 @@ pub fn resolve_affinity_with<T: CpuTopologyInspector>(
             }
             mask
         }
-        (Some(p), None) => p.core_mask(),
-        (None, Some(mask)) => mask,
-        (None, None) => {
-            // Default to X100 cluster (0x00FF) intersected with online CPUs
-            X100_CLUSTER_MASK & online_mask
+        (Some(ClusterSelection::Single(p)), None) => p.core_mask(),
+        (Some(ClusterSelection::Both { split }), Some(mask)) => {
+            if (mask & !(X100_CLUSTER_MASK | A100_CLUSTER_MASK)) != 0 {
+                return Err(K3Error::AffinityError {
+                    requested_mask: mask,
+                    requested_threads: req_threads_for_err,
+                    reason: format!(
+                        "explicit core mask 0x{mask:04X} contains cores outside valid clusters 0..15"
+                    ),
+                });
+            }
+            let has_x100 = (mask & X100_CLUSTER_MASK) != 0;
+            let has_a100 = (mask & A100_CLUSTER_MASK) != 0;
+            if !has_x100 || !has_a100 {
+                return Err(K3Error::AffinityError {
+                    requested_mask: mask,
+                    requested_threads: req_threads_for_err,
+                    reason: format!(
+                        "dual-cluster split policy '{}' requires cores on both X100 (0x00FF) and A100 (0xFF00), but mask 0x{mask:04X} does not cover both clusters",
+                        split.as_str()
+                    ),
+                });
+            }
+            mask
         }
+        (Some(ClusterSelection::Both { .. }), None) => X100_CLUSTER_MASK | A100_CLUSTER_MASK,
+        (None, Some(mask)) => mask,
+        (None, None) => X100_CLUSTER_MASK & online_mask,
     };
 
     // Enforce VLEN domain isolation guard: single-cluster pool must not mix X100 (0x00FF) and A100 (0xFF00)
     let has_x100_cores = (candidate_mask & X100_CLUSTER_MASK) != 0;
     let has_a100_cores = (candidate_mask & A100_CLUSTER_MASK) != 0;
-    if has_x100_cores && has_a100_cores {
+    let has_non_x100_cores = (candidate_mask & !X100_CLUSTER_MASK) != 0;
+    if !is_dual && has_x100_cores && has_non_x100_cores {
         return Err(K3Error::AffinityError {
             requested_mask: candidate_mask,
             requested_threads: req_threads_for_err,
@@ -392,68 +624,170 @@ pub fn resolve_affinity_with<T: CpuTopologyInspector>(
         });
     }
 
-    let available_cores: Vec<usize> = (0..64usize)
-        .filter(|&bit| (effective_mask & (1u64 << bit)) != 0)
-        .collect();
+    if is_dual {
+        let x100_online: Vec<usize> = (0..8)
+            .filter(|&c| (effective_mask & (1 << c)) != 0)
+            .collect();
+        let a100_online: Vec<usize> = (8..16)
+            .filter(|&c| (effective_mask & (1 << c)) != 0)
+            .collect();
 
-    // Determine thread count
-    let threads = match (requested_threads, preset, explicit_mask) {
-        (Some(n), Some(ClusterPreset::X100), None) => {
-            if n > X100_DEFAULT_MAX_COMPUTE_THREADS {
-                return Err(K3Error::AffinityError {
-                    requested_mask: effective_mask,
-                    requested_threads: n,
-                    reason: format!(
-                        "requested {n} compute threads on cluster 'x100' exceeds ADR-007 default cap of {X100_DEFAULT_MAX_COMPUTE_THREADS} (2 active + 1 spare reserved for control plane)"
-                    ),
-                });
-            }
-            n
+        if x100_online.is_empty() || a100_online.is_empty() {
+            return Err(K3Error::AffinityError {
+                requested_mask: candidate_mask,
+                requested_threads: req_threads_for_err,
+                reason: format!(
+                    "no online CPUs for both clusters in mask 0x{candidate_mask:04X} (x100 online: {}, a100 online: {})",
+                    x100_online.len(),
+                    a100_online.len()
+                ),
+            });
         }
-        (Some(n), _, _) => n,
-        (None, Some(p), None) => available_cores.len().min(p.default_max_threads()),
-        (None, _, Some(_)) => available_cores.len(),
-        (None, None, None) => 1,
-    };
 
-    if threads > available_cores.len() {
-        return Err(K3Error::AffinityError {
-            requested_mask: candidate_mask,
-            requested_threads: threads,
-            reason: format!(
-                "requested {threads} threads exceeds {} available cores in mask 0x{effective_mask:04X}",
-                available_cores.len()
-            ),
-        });
-    }
-
-    let assigned_cores: Vec<usize> = available_cores.into_iter().take(threads).collect();
-    let active_mask = assigned_cores
-        .iter()
-        .fold(0u64, |acc, &core| acc | (1u64 << core));
-
-    let inferred_cluster = preset.or({
-        if has_a100_cores && !has_x100_cores {
-            Some(ClusterPreset::A100)
-        } else if has_x100_cores && !has_a100_cores {
-            Some(ClusterPreset::X100)
+        let max_x100 = if explicit_mask.is_some() {
+            x100_online.len()
         } else {
-            None
+            x100_online.len().min(X100_DEFAULT_MAX_COMPUTE_THREADS)
+        };
+        let max_a100 = a100_online.len().min(A100_DEFAULT_MAX_COMPUTE_THREADS);
+        let total_cap = max_x100 + max_a100;
+
+        let (nx, na) = match requested_threads {
+            Some(n) => {
+                if n < 2 {
+                    return Err(K3Error::AffinityError {
+                        requested_mask: effective_mask,
+                        requested_threads: n,
+                        reason: "dual-cluster execution requires at least 2 worker threads (at least 1 per cluster)".to_owned(),
+                    });
+                }
+                if n > total_cap {
+                    return Err(K3Error::AffinityError {
+                        requested_mask: candidate_mask,
+                        requested_threads: n,
+                        reason: format!(
+                            "requested {n} threads exceeds available capacity of {total_cap} cores across both clusters (max X100: {max_x100}, max A100: {max_a100})"
+                        ),
+                    });
+                }
+                let half = n / 2;
+                let mut nx_calc = half.min(max_x100).max(1);
+                let mut na_calc = n - nx_calc;
+                if na_calc > max_a100 {
+                    na_calc = max_a100;
+                    nx_calc = n - na_calc;
+                }
+                if nx_calc > max_x100 {
+                    nx_calc = max_x100;
+                    na_calc = n - nx_calc;
+                }
+                (nx_calc, na_calc)
+            }
+            None => (max_x100, max_a100),
+        };
+
+        let x100_assigned: Vec<usize> = x100_online.into_iter().take(nx).collect();
+        let a100_assigned: Vec<usize> = a100_online.into_iter().take(na).collect();
+
+        let mut assigned_cores = Vec::with_capacity(nx + na);
+        assigned_cores.extend_from_slice(&x100_assigned);
+        assigned_cores.extend_from_slice(&a100_assigned);
+
+        let active_mask = assigned_cores
+            .iter()
+            .fold(0u64, |acc, &c| acc | (1u64 << c));
+
+        Ok(ResolvedAffinity {
+            cluster: None,
+            selection,
+            vlen_domain: VlenDomain::Heterogeneous,
+            effective_mask: active_mask,
+            threads: assigned_cores.len(),
+            assigned_cores,
+            x100_cores: x100_assigned,
+            a100_cores: a100_assigned,
+        })
+    } else {
+        // Single-cluster resolution (preserves US-01 logic exactly)
+        let preset = match &selection {
+            Some(ClusterSelection::Single(p)) => Some(*p),
+            _ => None,
+        };
+        let available_cores: Vec<usize> = (0..64usize)
+            .filter(|&bit| (effective_mask & (1u64 << bit)) != 0)
+            .collect();
+
+        let threads = match (requested_threads, preset, explicit_mask) {
+            (Some(n), Some(ClusterPreset::X100), None) => {
+                if n > X100_DEFAULT_MAX_COMPUTE_THREADS {
+                    return Err(K3Error::AffinityError {
+                        requested_mask: effective_mask,
+                        requested_threads: n,
+                        reason: format!(
+                            "requested {n} compute threads on cluster 'x100' exceeds ADR-007 default cap of {X100_DEFAULT_MAX_COMPUTE_THREADS} (2 active + 1 spare reserved for control plane)"
+                        ),
+                    });
+                }
+                n
+            }
+            (Some(n), _, _) => n,
+            (None, Some(p), None) => available_cores.len().min(p.default_max_threads()),
+            (None, _, Some(_)) => available_cores.len(),
+            (None, None, None) => 1,
+        };
+
+        if threads > available_cores.len() {
+            return Err(K3Error::AffinityError {
+                requested_mask: candidate_mask,
+                requested_threads: threads,
+                reason: format!(
+                    "requested {threads} threads exceeds {} available cores in mask 0x{effective_mask:04X}",
+                    available_cores.len()
+                ),
+            });
         }
-    });
 
-    let vlen_domain = match inferred_cluster {
-        Some(ClusterPreset::A100) => VlenDomain::Zvl1024b,
-        Some(ClusterPreset::X100) | None => VlenDomain::Zvl256b,
-    };
+        let assigned_cores: Vec<usize> = available_cores.into_iter().take(threads).collect();
+        let active_mask = assigned_cores
+            .iter()
+            .fold(0u64, |acc, &core| acc | (1u64 << core));
 
-    Ok(ResolvedAffinity {
-        cluster: inferred_cluster,
-        vlen_domain,
-        effective_mask: active_mask,
-        threads,
-        assigned_cores,
-    })
+        let inferred_cluster = preset.or({
+            if has_a100_cores && !has_x100_cores {
+                Some(ClusterPreset::A100)
+            } else if has_x100_cores && !has_a100_cores {
+                Some(ClusterPreset::X100)
+            } else {
+                None
+            }
+        });
+
+        let vlen_domain = match inferred_cluster {
+            Some(ClusterPreset::A100) => VlenDomain::Zvl1024b,
+            Some(ClusterPreset::X100) | None => VlenDomain::Zvl256b,
+        };
+
+        let mut x100_cores = Vec::new();
+        let mut a100_cores = Vec::new();
+        for &core in &assigned_cores {
+            if core < 8 {
+                x100_cores.push(core);
+            } else {
+                a100_cores.push(core);
+            }
+        }
+
+        Ok(ResolvedAffinity {
+            cluster: inferred_cluster,
+            selection,
+            vlen_domain,
+            effective_mask: active_mask,
+            threads,
+            assigned_cores,
+            x100_cores,
+            a100_cores,
+        })
+    }
 }
 
 /// Runtime affinity verification report for a single pinned compute worker thread (US-01.5.2).
@@ -511,7 +845,8 @@ impl WorkerWaitSlot {
 
     /// Accumulates wait duration in nanoseconds into this slot.
     pub fn record_wait_nanos(&self, delta_nanos: u64) {
-        self.accumulated_nanos.fetch_add(delta_nanos, Ordering::Relaxed);
+        self.accumulated_nanos
+            .fetch_add(delta_nanos, Ordering::Relaxed);
         self.barrier_count.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -651,7 +986,10 @@ impl FutexBarrier {
         }
 
         let start = Instant::now();
-        let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let current_gen = guard.generation;
         guard.count += 1;
         if guard.count == self.num_threads {
@@ -661,7 +999,10 @@ impl FutexBarrier {
             Duration::ZERO
         } else {
             while guard.generation == current_gen && !shutdown.load(Ordering::Relaxed) {
-                guard = self.cvar.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard = self
+                    .cvar
+                    .wait(guard)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
             start.elapsed()
         }
@@ -686,6 +1027,10 @@ enum PoolBackend {
     Rayon {
         pool: rayon::ThreadPool,
     },
+    Dual {
+        x100_pool: Box<WorkerPool>,
+        a100_pool: Box<WorkerPool>,
+    },
 }
 
 impl std::fmt::Debug for PoolBackend {
@@ -696,14 +1041,23 @@ impl std::fmt::Debug for PoolBackend {
                 .field("profile", profile)
                 .finish_non_exhaustive(),
             Self::Rayon { .. } => f.debug_struct("Rayon").finish_non_exhaustive(),
+            Self::Dual {
+                x100_pool,
+                a100_pool,
+            } => f
+                .debug_struct("Dual")
+                .field("x100_pool", x100_pool)
+                .field("a100_pool", a100_pool)
+                .finish(),
         }
     }
 }
 
-/// Affinity-pinned multi-core compute worker pool (US-01.5.2, US-02 R1).
+/// Affinity-pinned multi-core compute worker pool (US-01.5.2, US-02 R1, US-03 R1).
 ///
 /// Supports three multi-core coordination profiles (`spin`, `futex`, `rayon`),
-/// pins workers 1-to-1 to physical cores, and instruments cumulative barrier wait times.
+/// dual-cluster composite backends, pins workers 1-to-1 to physical cores,
+/// and instruments cumulative barrier wait times.
 pub struct WorkerPool {
     affinity: ResolvedAffinity,
     profile: CoordinationProfile,
@@ -745,6 +1099,64 @@ impl WorkerPool {
         affinity: ResolvedAffinity,
         profile: CoordinationProfile,
     ) -> Result<Self, K3Error> {
+        if affinity.is_dual_cluster() {
+            let x100_mask = affinity
+                .x100_cores
+                .iter()
+                .fold(0u64, |acc, &c| acc | (1u64 << c));
+            let a100_mask = affinity
+                .a100_cores
+                .iter()
+                .fold(0u64, |acc, &c| acc | (1u64 << c));
+
+            let x100_aff = ResolvedAffinity {
+                cluster: Some(ClusterPreset::X100),
+                selection: Some(ClusterSelection::Single(ClusterPreset::X100)),
+                vlen_domain: VlenDomain::Zvl256b,
+                effective_mask: x100_mask,
+                threads: affinity.x100_cores.len(),
+                assigned_cores: affinity.x100_cores.clone(),
+                x100_cores: affinity.x100_cores.clone(),
+                a100_cores: Vec::new(),
+            };
+            let a100_aff = ResolvedAffinity {
+                cluster: Some(ClusterPreset::A100),
+                selection: Some(ClusterSelection::Single(ClusterPreset::A100)),
+                vlen_domain: VlenDomain::Zvl1024b,
+                effective_mask: a100_mask,
+                threads: affinity.a100_cores.len(),
+                assigned_cores: affinity.a100_cores.clone(),
+                x100_cores: Vec::new(),
+                a100_cores: affinity.a100_cores.clone(),
+            };
+
+            let p1 = Self::new_with_profile(x100_aff, profile)?;
+            let p2 = Self::new_with_profile(a100_aff, profile)?;
+
+            let mut combined_statuses = p1.worker_statuses().to_vec();
+            let nx = combined_statuses.len();
+            for mut st in p2.worker_statuses().to_vec() {
+                st.worker_index += nx;
+                combined_statuses.push(st);
+            }
+
+            let mut combined_slots: Vec<WorkerWaitSlot> = Vec::with_capacity(affinity.threads);
+            for _ in 0..affinity.threads {
+                combined_slots.push(WorkerWaitSlot::new());
+            }
+
+            return Ok(Self {
+                affinity,
+                profile,
+                worker_statuses: combined_statuses,
+                wait_slots: combined_slots.into(),
+                backend: PoolBackend::Dual {
+                    x100_pool: Box::new(p1),
+                    a100_pool: Box::new(p2),
+                },
+            });
+        }
+
         let num_workers = affinity.threads;
         if num_workers == 0 || affinity.assigned_cores.len() != num_workers {
             return Err(K3Error::AffinityError {
@@ -801,11 +1213,14 @@ impl WorkerPool {
                     let handle = thread::Builder::new()
                         .name(format!("k3-worker-{worker_index}"))
                         .spawn(move || {
-                            let pin_result = pin_current_thread_and_verify(
+                            // SAFETY: `raw_pin_thread` uses only fixed-frame integer syscalls to pin the worker.
+                            let pin_res = unsafe { raw_pin_thread(assigned_core) };
+                            let pin_result = verify_pinned_thread(
                                 worker_index,
                                 assigned_core,
                                 req_mask,
                                 num_workers,
+                                pin_res,
                             );
                             let is_ok = pin_result.is_ok();
                             let _ = tx.send(pin_result);
@@ -854,11 +1269,18 @@ impl WorkerPool {
                             }
                         })
                         .map_err(|err| {
-                            shutdown_dedicated(&state, &shutdown, futex_barrier.as_ref(), &mut handles);
+                            shutdown_dedicated(
+                                &state,
+                                &shutdown,
+                                futex_barrier.as_ref(),
+                                &mut handles,
+                            );
                             K3Error::AffinityError {
                                 requested_mask: affinity.effective_mask,
                                 requested_threads: num_workers,
-                                reason: format!("failed to spawn worker thread {worker_index}: {err}"),
+                                reason: format!(
+                                    "failed to spawn worker thread {worker_index}: {err}"
+                                ),
                             }
                         })?;
 
@@ -869,13 +1291,25 @@ impl WorkerPool {
                 let mut worker_statuses = Vec::with_capacity(num_workers);
                 for _ in 0..num_workers {
                     match init_rx.recv() {
-                        Ok(Ok(status)) => worker_statuses.push(status),
+                        Ok(Ok(status)) => {
+                            worker_statuses.push(status);
+                        }
                         Ok(Err(err)) => {
-                            shutdown_dedicated(&state, &shutdown, futex_barrier.as_ref(), &mut handles);
+                            shutdown_dedicated(
+                                &state,
+                                &shutdown,
+                                futex_barrier.as_ref(),
+                                &mut handles,
+                            );
                             return Err(err);
                         }
                         Err(recv_err) => {
-                            shutdown_dedicated(&state, &shutdown, futex_barrier.as_ref(), &mut handles);
+                            shutdown_dedicated(
+                                &state,
+                                &shutdown,
+                                futex_barrier.as_ref(),
+                                &mut handles,
+                            );
                             return Err(K3Error::AffinityError {
                                 requested_mask: affinity.effective_mask,
                                 requested_threads: num_workers,
@@ -886,7 +1320,6 @@ impl WorkerPool {
                         }
                     }
                 }
-
                 worker_statuses.sort_by_key(|s| s.worker_index);
 
                 Ok(Self {
@@ -915,11 +1348,14 @@ impl WorkerPool {
                     .thread_name(|i| format!("k3-rayon-worker-{i}"))
                     .start_handler(move |worker_idx| {
                         let assigned_core = assigned_cores[worker_idx];
-                        let res = pin_current_thread_and_verify(
+                        // SAFETY: `raw_pin_thread` uses only fixed-frame integer syscalls to pin the worker.
+                        let pin_res = unsafe { raw_pin_thread(assigned_core) };
+                        let res = verify_pinned_thread(
                             worker_idx,
                             assigned_core,
                             req_mask,
                             num_workers,
+                            pin_res,
                         );
                         let _ = init_tx.send(res);
                     })
@@ -939,9 +1375,7 @@ impl WorkerPool {
                             return Err(K3Error::AffinityError {
                                 requested_mask: affinity.effective_mask,
                                 requested_threads: num_workers,
-                                reason: format!(
-                                    "rayon worker terminated prematurely: {recv_err}"
-                                ),
+                                reason: format!("rayon worker terminated prematurely: {recv_err}"),
                             });
                         }
                     }
@@ -1016,13 +1450,28 @@ impl WorkerPool {
     /// Returns cumulative inter-worker barrier wait time across all workers in milliseconds.
     #[must_use]
     pub fn cumulative_barrier_wait_ms(&self) -> f64 {
-        self.wait_slots.iter().map(WorkerWaitSlot::wait_ms).sum()
+        match &self.backend {
+            PoolBackend::Dual {
+                x100_pool,
+                a100_pool,
+            } => x100_pool.cumulative_barrier_wait_ms() + a100_pool.cumulative_barrier_wait_ms(),
+            _ => self.wait_slots.iter().map(WorkerWaitSlot::wait_ms).sum(),
+        }
     }
 
     /// Returns cumulative inter-worker barrier wait time across all workers in nanoseconds.
     #[must_use]
     pub fn cumulative_barrier_wait_nanos(&self) -> u64 {
-        self.wait_slots.iter().map(WorkerWaitSlot::wait_nanos).sum()
+        match &self.backend {
+            PoolBackend::Dual {
+                x100_pool,
+                a100_pool,
+            } => {
+                x100_pool.cumulative_barrier_wait_nanos()
+                    + a100_pool.cumulative_barrier_wait_nanos()
+            }
+            _ => self.wait_slots.iter().map(WorkerWaitSlot::wait_nanos).sum(),
+        }
     }
 
     /// Returns cumulative inter-worker barrier wait duration across all workers.
@@ -1033,8 +1482,22 @@ impl WorkerPool {
 
     /// Resets all per-worker barrier wait time accumulators.
     pub fn reset_barrier_wait(&self) {
-        for slot in self.wait_slots.iter() {
-            slot.reset();
+        match &self.backend {
+            PoolBackend::Dual {
+                x100_pool,
+                a100_pool,
+            } => {
+                x100_pool.reset_barrier_wait();
+                a100_pool.reset_barrier_wait();
+                for slot in self.wait_slots.iter() {
+                    slot.reset();
+                }
+            }
+            _ => {
+                for slot in self.wait_slots.iter() {
+                    slot.reset();
+                }
+            }
         }
     }
 
@@ -1044,37 +1507,78 @@ impl WorkerPool {
     }
 
     /// Re-reads `/proc/self/task/<tid>/status` (`Cpus_allowed_list`) for every active worker thread
-    /// to confirm strict 1-to-1 core binding and zero cross-cluster migration (US-01.5.2).
+    /// to confirm strict 1-to-1 core binding and zero cross-cluster migration (US-01.5.2, US-03 R3).
     ///
     /// # Errors
     ///
-    /// Returns [`K3Error::AffinityError`] if any worker thread has migrated outside its assigned core.
+    /// Returns [`K3Error::AffinityError`] if any worker thread has migrated outside its assigned core
+    /// or crossed the cluster boundary.
     pub fn verify_live_affinities(&self) -> Result<Vec<WorkerAffinityStatus>, K3Error> {
-        let mut live = Vec::with_capacity(self.worker_statuses.len());
-        for status in &self.worker_statuses {
-            let allowed_list = read_proc_task_cpus_allowed_list(status.tid)
-                .unwrap_or_else(|| status.proc_cpus_allowed_list.clone());
-            let parsed_mask = parse_cpu_list_mask(&allowed_list)?;
-            let expected_mask = 1u64 << status.assigned_core;
-            if parsed_mask != expected_mask {
-                return Err(K3Error::AffinityError {
-                    requested_mask: self.affinity.effective_mask,
-                    requested_threads: self.affinity.threads,
-                    reason: format!(
-                        "worker {} (tid {}) affinity drifted: expected core {} (0x{expected_mask:04X}), found Cpus_allowed_list='{allowed_list}' (0x{parsed_mask:04X})",
-                        status.worker_index, status.tid, status.assigned_core
-                    ),
+        if let PoolBackend::Dual {
+            x100_pool,
+            a100_pool,
+        } = &self.backend
+        {
+            let mut x100_live = x100_pool.verify_live_affinities()?;
+            let a100_live = a100_pool.verify_live_affinities()?;
+            let nx = x100_live.len();
+            for mut status in a100_live {
+                status.worker_index += nx;
+                x100_live.push(status);
+            }
+            Ok(x100_live)
+        } else {
+            let mut live = Vec::with_capacity(self.worker_statuses.len());
+            for status in &self.worker_statuses {
+                let allowed_list = read_proc_task_cpus_allowed_list(status.tid)
+                    .unwrap_or_else(|| status.proc_cpus_allowed_list.clone());
+                let parsed_mask = parse_cpu_list_mask(&allowed_list)?;
+                let expected_mask = 1u64 << status.assigned_core;
+                if parsed_mask != expected_mask {
+                    return Err(K3Error::AffinityError {
+                        requested_mask: self.affinity.effective_mask,
+                        requested_threads: self.affinity.threads,
+                        reason: format!(
+                            "worker {} (tid {}) affinity drifted: expected core {} (0x{expected_mask:04X}), found Cpus_allowed_list='{allowed_list}' (0x{parsed_mask:04X})",
+                            status.worker_index, status.tid, status.assigned_core
+                        ),
+                    });
+                }
+
+                // Enforce VLEN cluster boundary isolation:
+                // X100 worker (cores 0-7) must not touch A100 cores (8-15)
+                if status.assigned_core < 8 && (parsed_mask & A100_CLUSTER_MASK) != 0 {
+                    return Err(K3Error::AffinityError {
+                        requested_mask: self.affinity.effective_mask,
+                        requested_threads: self.affinity.threads,
+                        reason: format!(
+                            "worker {} (tid {}) assigned to X100 core {} migrated into A100 cluster mask (0x{parsed_mask:04X})",
+                            status.worker_index, status.tid, status.assigned_core
+                        ),
+                    });
+                }
+                // A100 worker (cores 8-15) must not touch X100 cores (0-7)
+                if status.assigned_core >= 8 && (parsed_mask & X100_CLUSTER_MASK) != 0 {
+                    return Err(K3Error::AffinityError {
+                        requested_mask: self.affinity.effective_mask,
+                        requested_threads: self.affinity.threads,
+                        reason: format!(
+                            "worker {} (tid {}) assigned to A100 core {} migrated into X100 cluster mask (0x{parsed_mask:04X})",
+                            status.worker_index, status.tid, status.assigned_core
+                        ),
+                    });
+                }
+
+                live.push(WorkerAffinityStatus {
+                    worker_index: status.worker_index,
+                    tid: status.tid,
+                    assigned_core: status.assigned_core,
+                    sched_affinity_mask: parsed_mask,
+                    proc_cpus_allowed_list: allowed_list,
                 });
             }
-            live.push(WorkerAffinityStatus {
-                worker_index: status.worker_index,
-                tid: status.tid,
-                assigned_core: status.assigned_core,
-                sched_affinity_mask: parsed_mask,
-                proc_cpus_allowed_list: allowed_list,
-            });
+            Ok(live)
         }
-        Ok(live)
     }
 
     /// Executes `task(worker_index, total_workers)` in parallel across all pinned worker threads
@@ -1083,7 +1587,34 @@ impl WorkerPool {
     where
         F: Fn(usize, usize) + Send + Sync + 'static,
     {
+        self.execute_job(Arc::new(task));
+    }
+
+    /// Internal non-generic job dispatcher to eliminate recursive monomorphization across dual pools.
+    pub fn execute_job(&self, job: JobFn) {
         match &self.backend {
+            PoolBackend::Dual {
+                x100_pool,
+                a100_pool,
+            } => {
+                let j1 = Arc::clone(&job);
+                let j2 = Arc::clone(&job);
+                let total_workers = self.affinity.threads;
+                let nx = x100_pool.thread_count();
+
+                thread::scope(|s| {
+                    s.spawn(move || {
+                        let wrapped: JobFn = Arc::new(move |w_idx, _| {
+                            j1(w_idx, total_workers);
+                        });
+                        x100_pool.execute_job(wrapped);
+                    });
+                    let wrapped: JobFn = Arc::new(move |w_idx, _| {
+                        j2(nx + w_idx, total_workers);
+                    });
+                    a100_pool.execute_job(wrapped);
+                });
+            }
             PoolBackend::DedicatedThreads {
                 state,
                 shutdown,
@@ -1092,7 +1623,6 @@ impl WorkerPool {
                 coordinator_sense,
                 ..
             } => {
-                let job: JobFn = Arc::new(task);
                 {
                     let (lock, cvar) = &**state;
                     let mut guard = lock
@@ -1131,9 +1661,9 @@ impl WorkerPool {
                     rayon::scope(|s| {
                         for worker_idx in 0..num_workers {
                             let finish_times_clone = Arc::clone(&finish_times);
-                            let task_ref = &task;
+                            let job_clone = Arc::clone(&job);
                             s.spawn(move |_| {
-                                task_ref(worker_idx, num_workers);
+                                job_clone(worker_idx, num_workers);
                                 let elapsed_ns =
                                     u64::try_from(t_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
                                 finish_times_clone[worker_idx].store(elapsed_ns, Ordering::Release);
@@ -1142,8 +1672,7 @@ impl WorkerPool {
                     });
                 });
 
-                let t_total_ns =
-                    u64::try_from(t_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                let t_total_ns = u64::try_from(t_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 for worker_idx in 0..num_workers {
                     let finish_ns = finish_times[worker_idx].load(Ordering::Acquire);
                     let wait_ns = t_total_ns.saturating_sub(finish_ns);
@@ -1151,6 +1680,94 @@ impl WorkerPool {
                 }
             }
         }
+    }
+
+    /// Executes a task exclusively across X100 worker threads.
+    pub fn execute_x100<F>(&self, task: F)
+    where
+        F: Fn(usize, usize) + Send + Sync + 'static,
+    {
+        match &self.backend {
+            PoolBackend::Dual { x100_pool, .. } => x100_pool.execute_job(Arc::new(task)),
+            _ => {
+                if self.affinity.cluster == Some(ClusterPreset::X100)
+                    || (!self.affinity.x100_cores.is_empty() && self.affinity.a100_cores.is_empty())
+                {
+                    self.execute_job(Arc::new(task));
+                }
+            }
+        }
+    }
+
+    /// Executes a task exclusively across A100 worker threads.
+    pub fn execute_a100<F>(&self, task: F)
+    where
+        F: Fn(usize, usize) + Send + Sync + 'static,
+    {
+        match &self.backend {
+            PoolBackend::Dual { a100_pool, .. } => a100_pool.execute_job(Arc::new(task)),
+            _ => {
+                if self.affinity.cluster == Some(ClusterPreset::A100)
+                    || (!self.affinity.a100_cores.is_empty() && self.affinity.x100_cores.is_empty())
+                {
+                    self.execute_job(Arc::new(task));
+                }
+            }
+        }
+    }
+
+    /// Executes independent tasks concurrently across X100 and A100 worker pools.
+    pub fn execute_split<FX, FA>(&self, x100_task: FX, a100_task: FA)
+    where
+        FX: Fn(usize, usize) + Send + Sync + 'static,
+        FA: Fn(usize, usize) + Send + Sync + 'static,
+    {
+        match &self.backend {
+            PoolBackend::Dual {
+                x100_pool,
+                a100_pool,
+            } => {
+                let jx: JobFn = Arc::new(x100_task);
+                let ja: JobFn = Arc::new(a100_task);
+                thread::scope(|s| {
+                    s.spawn(|| {
+                        x100_pool.execute_job(jx);
+                    });
+                    a100_pool.execute_job(ja);
+                });
+            }
+            _ => {
+                if self.affinity.cluster == Some(ClusterPreset::A100) {
+                    self.execute_job(Arc::new(a100_task));
+                } else {
+                    self.execute_job(Arc::new(x100_task));
+                }
+            }
+        }
+    }
+
+    /// Returns a reference to the X100 worker pool if operating in dual-cluster mode.
+    #[must_use]
+    pub fn x100_pool(&self) -> Option<&WorkerPool> {
+        match &self.backend {
+            PoolBackend::Dual { x100_pool, .. } => Some(x100_pool.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Returns a reference to the A100 worker pool if operating in dual-cluster mode.
+    #[must_use]
+    pub fn a100_pool(&self) -> Option<&WorkerPool> {
+        match &self.backend {
+            PoolBackend::Dual { a100_pool, .. } => Some(a100_pool.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if this worker pool is backed by a dual-cluster configuration.
+    #[must_use]
+    pub fn is_dual(&self) -> bool {
+        matches!(self.backend, PoolBackend::Dual { .. })
     }
 }
 
@@ -1192,65 +1809,108 @@ fn shutdown_dedicated(
     }
 }
 
-fn pin_current_thread_and_verify(
+/// Low-level thread pinning helper that performs only integer operations and direct POSIX syscalls.
+///
+/// CRITICAL ARCHITECTURAL REQUIREMENT:
+/// On the `SpacemiT` K3 heterogeneous `SoC`, Cluster 0 (X100) has VLEN = 256 bits (`vlenb = 32`),
+/// while Cluster 1 (A100) has VLEN = 1024 bits (`vlenb = 128`).
+/// Newly spawned threads originate on Cluster 0. When migrating to Cluster 1 (`assigned_core >= 8`),
+/// the thread moves across VLEN domains.
+/// Any function compiled with RVV enabled (`+v`) that allocates scalable vector registers or vector spill
+/// slots adjusts its stack frame via `csrr vlenb; sub sp, sp, ...` in its prologue and `add sp, sp, ...`
+/// in its epilogue. If the thread migrates inside such a function, the prologue executes with `vlenb = 32`
+/// while the epilogue executes with `vlenb = 128`, shifting `sp` and corrupting the return address (`ra`).
+///
+/// To guarantee 100% stack frame integrity across the heterogeneous VLEN boundary:
+/// 1. `raw_pin_thread` performs no heap allocations, uses no `cpu_set_t` array or vector types,
+///    ensuring LLVM allocates a fixed, constant-size stack frame unaffected by `vlenb`.
+/// 2. It registers with `/proc/set_ai_thread` if `assigned_core >= 8` (vendor HMP requirement).
+/// 3. It executes `sched_setaffinity` and `sched_getaffinity` via raw syscalls.
+/// 4. When it returns, the thread is permanently on `assigned_core`, so all subsequent function calls
+///    have matching prologues and epilogues in that cluster's native VLEN domain.
+#[inline(never)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "syscall return codes and decimal digits fit in i32/u8"
+)]
+unsafe fn raw_pin_thread(assigned_core: usize) -> Result<u64, i32> {
+    // SAFETY: Raw Linux syscalls and libc file operations to pin the thread
+    // without triggering scalable vector spill allocation in function frame.
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid);
+        if assigned_core >= 8 {
+            let path = b"/proc/set_ai_thread\0";
+            let fd = libc::open(path.as_ptr().cast::<libc::c_char>(), libc::O_WRONLY);
+            if fd >= 0 {
+                let mut buf = [0u8; 32];
+                let mut val = tid;
+                let mut tmp = [0u8; 32];
+                let mut i = 0;
+                if val == 0 {
+                    buf[0] = b'0';
+                    i = 1;
+                } else {
+                    while val > 0 {
+                        tmp[i] = b'0' + (val % 10) as u8;
+                        val /= 10;
+                        i += 1;
+                    }
+                    for j in 0..i {
+                        buf[j] = tmp[i - 1 - j];
+                    }
+                }
+                buf[i] = b'\n';
+                libc::write(fd, buf.as_ptr().cast::<libc::c_void>(), i + 1);
+                libc::close(fd);
+            }
+        }
+
+        let mask = 1u64 << assigned_core;
+        let set_ret = libc::syscall(
+            libc::SYS_sched_setaffinity,
+            0i32,
+            size_of::<u64>(),
+            (&raw const mask).cast::<libc::c_void>(),
+        ) as i32;
+        if set_ret < 0 {
+            return Err(set_ret);
+        }
+
+        let mut get_mask = 0u64;
+        let get_ret = libc::syscall(
+            libc::SYS_sched_getaffinity,
+            0i32,
+            size_of::<u64>(),
+            (&raw mut get_mask).cast::<libc::c_void>(),
+        ) as i32;
+        if get_ret < 0 {
+            return Err(get_ret);
+        }
+
+        Ok(get_mask)
+    }
+}
+
+fn verify_pinned_thread(
     worker_index: usize,
     assigned_core: usize,
     requested_mask: u64,
     requested_threads: usize,
+    pin_res: Result<u64, i32>,
 ) -> Result<WorkerAffinityStatus, K3Error> {
-    // 1. Construct cpu_set_t with only `assigned_core` set
-    // SAFETY: zero-initializing cpu_set_t and setting a single valid core bit via CPU_ZERO/CPU_SET.
-    let mut cpuset: libc::cpu_set_t = unsafe { core::mem::zeroed() };
-    // SAFETY: CPU_ZERO and CPU_SET operate on valid local cpuset struct.
-    unsafe {
-        libc::CPU_ZERO(&mut cpuset);
-        libc::CPU_SET(assigned_core, &mut cpuset);
-    }
-
-    // 2. Pin current thread via sched_setaffinity(0, ...)
-    // SAFETY: sched_setaffinity with pid=0 pins the calling OS thread.
-    let set_res =
-        unsafe { libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &raw const cpuset) };
-    if set_res != 0 {
-        let os_err = std::io::Error::last_os_error();
-        return Err(K3Error::AffinityError {
-            requested_mask,
-            requested_threads,
-            reason: format!(
-                "sched_setaffinity failed for worker {worker_index} on core {assigned_core}: {os_err}"
-            ),
-        });
-    }
-
-    // 3. Query OS thread ID (TID)
-    // SAFETY: SYS_gettid is a thread-safe Linux syscall taking no arguments.
-    let tid = unsafe { libc::syscall(libc::SYS_gettid) };
-
-    // 4. Verify via sched_getaffinity(0, ...)
-    // SAFETY: zero-initializing cpu_set_t for sched_getaffinity output.
-    let mut verify_set: libc::cpu_set_t = unsafe { core::mem::zeroed() };
-    // SAFETY: sched_getaffinity with pid=0 reads calling thread's CPU mask into verify_set.
-    let get_res =
-        unsafe { libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &raw mut verify_set) };
-    if get_res != 0 {
-        let os_err = std::io::Error::last_os_error();
-        return Err(K3Error::AffinityError {
-            requested_mask,
-            requested_threads,
-            reason: format!(
-                "sched_getaffinity verification failed for worker {worker_index}: {os_err}"
-            ),
-        });
-    }
-
-    let mut observed_mask = 0u64;
-    for core_id in 0..64usize {
-        // SAFETY: CPU_ISSET reads from valid verify_set populated by sched_getaffinity.
-        let is_set = unsafe { libc::CPU_ISSET(core_id, &verify_set) };
-        if is_set {
-            observed_mask |= 1u64 << core_id;
+    let observed_mask = match pin_res {
+        Ok(mask) => mask,
+        Err(err) => {
+            return Err(K3Error::AffinityError {
+                requested_mask,
+                requested_threads,
+                reason: format!(
+                    "sched_setaffinity/getaffinity failed for worker {worker_index} on core {assigned_core} (errno {err})"
+                ),
+            });
         }
-    }
+    };
 
     let expected_mask = 1u64 << assigned_core;
     if observed_mask != expected_mask {
@@ -1263,7 +1923,8 @@ fn pin_current_thread_and_verify(
         });
     }
 
-    // 5. Read /proc/self/task/<tid>/status Cpus_allowed_list
+    // SAFETY: SYS_gettid is thread-safe taking no args.
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) };
     let proc_cpus_allowed_list =
         read_proc_task_cpus_allowed_list(tid).unwrap_or_else(|| assigned_core.to_string());
 
@@ -1274,6 +1935,24 @@ fn pin_current_thread_and_verify(
         sched_affinity_mask: observed_mask,
         proc_cpus_allowed_list,
     })
+}
+
+#[allow(dead_code)]
+fn pin_current_thread_and_verify(
+    worker_index: usize,
+    assigned_core: usize,
+    requested_mask: u64,
+    requested_threads: usize,
+) -> Result<WorkerAffinityStatus, K3Error> {
+    // SAFETY: `raw_pin_thread` uses only fixed-frame integer syscalls to pin the calling thread.
+    let pin_res = unsafe { raw_pin_thread(assigned_core) };
+    verify_pinned_thread(
+        worker_index,
+        assigned_core,
+        requested_mask,
+        requested_threads,
+        pin_res,
+    )
 }
 
 fn read_proc_task_cpus_allowed_list(tid: i64) -> Option<String> {
@@ -1399,6 +2078,19 @@ mod tests {
     }
 
     #[test]
+    fn test_worker_pool_on_a100() {
+        let topo = SystemCpuTopology::new();
+        let a100 = resolve_affinity_with(Some("a100"), None, Some(1), &topo).unwrap();
+        let pool = WorkerPool::new(a100).unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+        pool.execute(move |_worker_idx, _total| {
+            counter_clone.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn test_worker_wait_slot_alignment_and_stride_adr006() {
         assert_eq!(align_of::<WorkerWaitSlot>(), 64);
         assert_eq!(size_of::<WorkerWaitSlot>(), 64);
@@ -1476,5 +2168,113 @@ mod tests {
         for h in handles {
             let _ = h.join().expect("futex barrier thread completes");
         }
+    }
+
+    #[test]
+    fn test_dual_cluster_split_resolution_us03_m1() {
+        let k3_topo = MockCpuTopology::spacemit_k3();
+
+        // 1. Default dual-cluster resolution: 14 threads (6 on X100, 8 on A100)
+        let resolved =
+            resolve_affinity_split_with(Some("both"), Some("phase"), None, None, &k3_topo)
+                .expect("resolve dual-cluster phase split");
+
+        assert!(resolved.is_dual_cluster());
+        assert_eq!(resolved.split_strategy(), Some(SplitStrategy::Phase));
+        assert_eq!(resolved.vlen_domain, VlenDomain::Heterogeneous);
+        assert_eq!(resolved.threads, 14);
+        assert_eq!(resolved.x100_cores, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(resolved.a100_cores, vec![8, 9, 10, 11, 12, 13, 14, 15]);
+        assert_eq!(
+            resolved.assigned_cores,
+            vec![0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+        assert_eq!(resolved.effective_mask, 0xFF3F);
+
+        // 2. Op and Row split strategies
+        let op_res = resolve_affinity_split_with(Some("both"), Some("op"), None, None, &k3_topo)
+            .expect("resolve dual-cluster op split");
+        assert_eq!(op_res.split_strategy(), Some(SplitStrategy::Op));
+
+        let row_res = resolve_affinity_split_with(Some("both"), Some("row"), None, None, &k3_topo)
+            .expect("resolve dual-cluster row split");
+        assert_eq!(row_res.split_strategy(), Some(SplitStrategy::Row));
+
+        // 3. Custom thread count balanced across clusters
+        let balanced =
+            resolve_affinity_split_with(Some("both"), Some("row"), None, Some(8), &k3_topo)
+                .expect("resolve balanced 8 threads");
+        assert_eq!(balanced.threads, 8);
+        assert_eq!(balanced.x100_cores, vec![0, 1, 2, 3]);
+        assert_eq!(balanced.a100_cores, vec![8, 9, 10, 11]);
+
+        // 4. Custom core mask spanning both clusters
+        let custom_mask = resolve_affinity_split_with(
+            Some("both"),
+            Some("phase"),
+            Some(0x0303),
+            Some(4),
+            &k3_topo,
+        )
+        .expect("resolve custom dual mask");
+        assert_eq!(custom_mask.threads, 4);
+        assert_eq!(custom_mask.x100_cores, vec![0, 1]);
+        assert_eq!(custom_mask.a100_cores, vec![8, 9]);
+    }
+
+    #[test]
+    fn test_invalid_dual_cluster_combinations_rejected_us03_m1() {
+        let k3_topo = MockCpuTopology::spacemit_k3();
+
+        // 1. --cluster both without --split is rejected
+        let no_split = resolve_affinity_with(Some("both"), None, None, &k3_topo)
+            .expect_err("must reject both without split");
+        assert_eq!(no_split.diagnostic_code(), "affinity_error");
+        assert!(
+            no_split
+                .to_string()
+                .contains("requires an explicit --split")
+        );
+
+        // 2. --split with single cluster is rejected
+        let split_x100 =
+            resolve_affinity_split_with(Some("x100"), Some("phase"), None, None, &k3_topo)
+                .expect_err("must reject split with x100");
+        assert_eq!(split_x100.diagnostic_code(), "affinity_error");
+        assert!(
+            split_x100
+                .to_string()
+                .contains("only valid with '--cluster both'")
+        );
+
+        // 3. Unknown split strategy is rejected
+        let bad_split =
+            resolve_affinity_split_with(Some("both"), Some("invalid"), None, None, &k3_topo)
+                .expect_err("must reject unknown split strategy");
+        assert_eq!(bad_split.diagnostic_code(), "affinity_error");
+        assert!(bad_split.to_string().contains("unknown split strategy"));
+
+        // 4. Threads < 2 on dual-cluster is rejected
+        let threads_1 =
+            resolve_affinity_split_with(Some("both"), Some("row"), None, Some(1), &k3_topo)
+                .expect_err("must reject 1 thread on dual cluster");
+        assert_eq!(threads_1.diagnostic_code(), "affinity_error");
+        assert!(threads_1.to_string().contains("at least 2 worker threads"));
+
+        // 5. Explicit mask not covering both clusters with --cluster both is rejected
+        let x100_only_mask = resolve_affinity_split_with(
+            Some("both"),
+            Some("phase"),
+            Some(0x00FF),
+            Some(2),
+            &k3_topo,
+        )
+        .expect_err("must reject single-cluster mask with both");
+        assert_eq!(x100_only_mask.diagnostic_code(), "affinity_error");
+        assert!(
+            x100_only_mask
+                .to_string()
+                .contains("does not cover both clusters")
+        );
     }
 }

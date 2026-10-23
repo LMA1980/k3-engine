@@ -53,8 +53,11 @@ impl TempModelFixture {
             ("output_norm.weight", QuantType::F32, &[16][..]),
         ];
         let bytes = create_synthetic_gguf_v3("synthetic", 32, &tensor_specs);
-        let path = std::env::temp_dir()
-            .join(format!("k3_us02_e2e_{tag}_{}_{}.gguf", std::process::id(), fastrand()));
+        let path = std::env::temp_dir().join(format!(
+            "k3_us02_e2e_{tag}_{}_{}.gguf",
+            std::process::id(),
+            fastrand()
+        ));
         let mut f = File::create(&path).expect("create temp synthetic GGUF model");
         f.write_all(&bytes).expect("write GGUF bytes");
         f.sync_all().expect("sync GGUF file");
@@ -226,8 +229,18 @@ impl SimpleJson {
         if chars[*idx] == '-' {
             *idx += 1;
         }
-        while *idx < chars.len() && (chars[*idx].is_ascii_digit() || chars[*idx] == '.' || chars[*idx] == 'e' || chars[*idx] == 'E' || chars[*idx] == '+' || chars[*idx] == '-') {
-            if (chars[*idx] == '+' || chars[*idx] == '-') && chars[*idx - 1] != 'e' && chars[*idx - 1] != 'E' {
+        while *idx < chars.len()
+            && (chars[*idx].is_ascii_digit()
+                || chars[*idx] == '.'
+                || chars[*idx] == 'e'
+                || chars[*idx] == 'E'
+                || chars[*idx] == '+'
+                || chars[*idx] == '-')
+        {
+            if (chars[*idx] == '+' || chars[*idx] == '-')
+                && chars[*idx - 1] != 'e'
+                && chars[*idx - 1] != 'E'
+            {
                 break;
             }
             *idx += 1;
@@ -260,7 +273,10 @@ impl SimpleJson {
             if chars[*idx] == ',' {
                 *idx += 1;
             } else {
-                return Err(format!("expected ',' or ']' in array, got '{}'", chars[*idx]));
+                return Err(format!(
+                    "expected ',' or ']' in array, got '{}'",
+                    chars[*idx]
+                ));
             }
         }
         Ok(Self::Array(items))
@@ -298,7 +314,10 @@ impl SimpleJson {
             if chars[*idx] == ',' {
                 *idx += 1;
             } else {
-                return Err(format!("expected ',' or '}}' in object, got '{}'", chars[*idx]));
+                return Err(format!(
+                    "expected ',' or '}}' in object, got '{}'",
+                    chars[*idx]
+                ));
             }
         }
         Ok(Self::Object(map))
@@ -377,7 +396,9 @@ fn test_tier1_feature_coordination_spin() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Stdout table must display TTFT, decode throughput, and cumulative barrier wait
     assert!(
-        stdout.contains("TTFT") || stdout.contains("ttft") || stdout.contains("Time to First Token"),
+        stdout.contains("TTFT")
+            || stdout.contains("ttft")
+            || stdout.contains("Time to First Token"),
         "stdout must report TTFT metric: {stdout}"
     );
     assert!(
@@ -458,7 +479,10 @@ fn test_tier1_feature_coordination_rayon() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("barrier") || stdout.contains("wait") || stdout.contains("Rayon") || stdout.contains("rayon"),
+        stdout.contains("barrier")
+            || stdout.contains("wait")
+            || stdout.contains("Rayon")
+            || stdout.contains("rayon"),
         "stdout must report metrics for rayon coordination: {stdout}"
     );
 }
@@ -505,7 +529,10 @@ fn test_tier1_feature_multi_run_repeat_pipeline_statistics() {
         "stdout must report max metric: {stdout}"
     );
     assert!(
-        stdout.contains("stddev") || stdout.contains("StdDev") || stdout.contains("std dev") || stdout.contains("σ"),
+        stdout.contains("stddev")
+            || stdout.contains("StdDev")
+            || stdout.contains("std dev")
+            || stdout.contains("σ"),
         "stdout must report stddev metric: {stdout}"
     );
 }
@@ -566,7 +593,11 @@ fn test_tier1_feature_json_structured_export_schema() {
         .get("runs")
         .and_then(|v| v.as_array())
         .expect("runs array present");
-    assert_eq!(runs.len(), 3, "runs array must contain exactly 3 iterations");
+    assert_eq!(
+        runs.len(),
+        3,
+        "runs array must contain exactly 3 iterations"
+    );
 
     // Verify runs[0] has required metric fields
     let first_run = &runs[0];
@@ -689,7 +720,10 @@ fn test_tier2_boundary_single_worker_thread_no_deadlock() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json = SimpleJson::parse(stdout.trim()).expect("valid json on 1 thread");
-    let runs = json.get("runs").and_then(|v| v.as_array()).expect("runs array");
+    let runs = json
+        .get("runs")
+        .and_then(|v| v.as_array())
+        .expect("runs array");
     assert_eq!(runs.len(), 3);
 
     // On 1 thread, barrier wait ratio should be negligible (near 0)
@@ -735,7 +769,10 @@ fn test_tier2_boundary_zero_max_tokens_prefill_only() {
     let json = SimpleJson::parse(stdout.trim()).expect("valid json on max-tokens 0");
     let stats = json.get("statistics").expect("statistics present");
     let ttft = stats.get("ttft_ms").expect("ttft_ms present");
-    let mean_ttft = ttft.get("mean").and_then(|v| v.as_f64()).expect("ttft mean");
+    let mean_ttft = ttft
+        .get("mean")
+        .and_then(|v| v.as_f64())
+        .expect("ttft mean");
     assert!(mean_ttft >= 0.0, "ttft must be non-negative");
 }
 
@@ -830,12 +867,19 @@ fn test_tier3_combo_spin_large_repeat_json_export() {
         .output()
         .expect("spawn k3-diag spin + 5 repeats + json");
 
-    assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json = SimpleJson::parse(stdout.trim()).expect("valid json");
 
-    let runs = json.get("runs").and_then(|v| v.as_array()).expect("runs array");
+    let runs = json
+        .get("runs")
+        .and_then(|v| v.as_array())
+        .expect("runs array");
     assert_eq!(runs.len(), 5, "must have recorded exactly 5 runs");
 
     let stats = json.get("statistics").expect("statistics present");
@@ -843,7 +887,10 @@ fn test_tier3_combo_spin_large_repeat_json_export() {
     let mean = ttft.get("mean").and_then(|v| v.as_f64()).expect("mean");
     let min = ttft.get("min").and_then(|v| v.as_f64()).expect("min");
     let max = ttft.get("max").and_then(|v| v.as_f64()).expect("max");
-    assert!(min <= mean && mean <= max, "min ({min}) <= mean ({mean}) <= max ({max})");
+    assert!(
+        min <= mean && mean <= max,
+        "min ({min}) <= mean ({mean}) <= max ({max})"
+    );
 }
 
 /// T3.2: Combination — Futex Coordination + Scaled Threads + JSON Export.
@@ -867,11 +914,18 @@ fn test_tier3_combo_futex_scaled_threads_json_export() {
         .output()
         .expect("spawn k3-diag futex + 4 threads + json");
 
-    assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json = SimpleJson::parse(stdout.trim()).expect("valid json");
-    let threads = json.get("threads").and_then(|v| v.as_f64()).expect("threads count");
+    let threads = json
+        .get("threads")
+        .and_then(|v| v.as_f64())
+        .expect("threads count");
     assert_eq!(threads as usize, 4);
 }
 
@@ -897,7 +951,11 @@ fn test_tier3_combo_rayon_cluster_x100_table_output() {
         .output()
         .expect("spawn k3-diag rayon + x100 table");
 
-    assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.is_empty(), "stdout table must be non-empty");
 }
@@ -925,11 +983,17 @@ fn test_tier3_combo_spin_explicit_cores_and_threads_json() {
         .output()
         .expect("spawn k3-diag spin + explicit cores + json");
 
-    assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json = SimpleJson::parse(stdout.trim()).expect("valid json");
-    let mask = json.get("effective_core_mask").expect("effective_core_mask");
+    let mask = json
+        .get("effective_core_mask")
+        .expect("effective_core_mask");
     let mask_str = mask.as_str().unwrap_or("");
     assert!(
         mask_str.contains("3") || mask_str.contains("0x0003") || mask_str.contains("0x3"),
@@ -986,14 +1050,18 @@ fn test_tier4_scenario1_comparative_synchronization_overhead() {
 
     for (name, report) in &reports {
         let stats = report.get("statistics").expect("statistics present");
-        let barrier = stats.get("cumulative_barrier_wait_ms").expect("barrier wait stats");
+        let barrier = stats
+            .get("cumulative_barrier_wait_ms")
+            .expect("barrier wait stats");
         let mean_wait = barrier.get("mean").and_then(|v| v.as_f64()).unwrap_or(0.0);
         assert!(
             mean_wait >= 0.0,
             "profile {name} mean barrier wait must be non-negative: {mean_wait}"
         );
 
-        let util = stats.get("compute_utilization_ratio").expect("compute util stats");
+        let util = stats
+            .get("compute_utilization_ratio")
+            .expect("compute util stats");
         let mean_util = util.get("mean").and_then(|v| v.as_f64()).unwrap_or(0.0);
         assert!(
             (0.0..=1.0).contains(&mean_util),
@@ -1027,11 +1095,18 @@ fn test_tier4_scenario2_determinism_at_temperature_zero() {
         .output()
         .expect("spawn spin for determinism test");
 
-    assert!(out_spin.status.success(), "spin stderr={}", String::from_utf8_lossy(&out_spin.stderr));
+    assert!(
+        out_spin.status.success(),
+        "spin stderr={}",
+        String::from_utf8_lossy(&out_spin.stderr)
+    );
     let json_spin = SimpleJson::parse(String::from_utf8_lossy(&out_spin.stdout).trim())
         .expect("valid spin json");
     assert!(
-        json_spin.get("determinism_verified").and_then(|v| v.as_bool()).unwrap_or(false),
+        json_spin
+            .get("determinism_verified")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         "determinism_verified must be true in spin profile"
     );
 
@@ -1053,11 +1128,18 @@ fn test_tier4_scenario2_determinism_at_temperature_zero() {
         .output()
         .expect("spawn futex for determinism test");
 
-    assert!(out_futex.status.success(), "futex stderr={}", String::from_utf8_lossy(&out_futex.stderr));
+    assert!(
+        out_futex.status.success(),
+        "futex stderr={}",
+        String::from_utf8_lossy(&out_futex.stderr)
+    );
     let json_futex = SimpleJson::parse(String::from_utf8_lossy(&out_futex.stdout).trim())
         .expect("valid futex json");
     assert!(
-        json_futex.get("determinism_verified").and_then(|v| v.as_bool()).unwrap_or(false),
+        json_futex
+            .get("determinism_verified")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         "determinism_verified must be true in futex profile"
     );
 }
@@ -1158,7 +1240,11 @@ fn test_adversarial_special_character_escaping_in_json() {
         .output()
         .expect("spawn with adversarial prompt");
 
-    assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed = SimpleJson::parse(stdout.trim());
@@ -1206,7 +1292,10 @@ fn test_adversarial_statistical_properties_and_bessel_correction() {
     // Sum of squared diffs: (10-12)^2 + (12-12)^2 + (14-12)^2 = 4 + 0 + 4 = 8.
     // Sample variance with N-1 = 8 / 2 = 4.0.
     // Sample stddev = sqrt(4.0) = 2.0.
-    assert!((stddev - 2.0).abs() < 1e-9, "stddev must be exactly 2.0 with Bessel's correction");
+    assert!(
+        (stddev - 2.0).abs() < 1e-9,
+        "stddev must be exactly 2.0 with Bessel's correction"
+    );
 
     // Zero-variance property: identical values must yield stddev == 0.0
     let identical = [5.5, 5.5, 5.5, 5.5];

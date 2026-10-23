@@ -15,8 +15,8 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
-use k3_core::{CoordinationProfile, QuantType};
 use k3_core::test_helpers::create_synthetic_gguf_v3;
+use k3_core::{CoordinationProfile, QuantType};
 use k3_engine::{
     CpuTopologyInspector, LockedModelWeights, SinglePromptEngine, SingleSlotKvArena, StreamAction,
     SystemCpuTopology, SystemMemoryInspector, WorkerPool, X100_CLUSTER_MASK, resolve_affinity,
@@ -28,8 +28,10 @@ fn write_synthetic_gguf_fixture(tag: &str) -> PathBuf {
         ("output_norm.weight", QuantType::F32, &[16][..]),
     ];
     let bytes = create_synthetic_gguf_v3("synthetic", 32, &tensor_specs);
-    let path = std::env::temp_dir()
-        .join(format!("us02_engine_fixture_{tag}_{}.gguf", std::process::id()));
+    let path = std::env::temp_dir().join(format!(
+        "us02_engine_fixture_{tag}_{}.gguf",
+        std::process::id()
+    ));
     let mut f = File::create(&path).expect("create synthetic GGUF fixture");
     f.write_all(&bytes).expect("write GGUF fixture bytes");
     f.sync_all().expect("sync GGUF fixture");
@@ -127,7 +129,10 @@ fn test_us02_multicore_pipeline_affinity_stability_and_determinism() {
 
     // 5. Calculate Descriptive Statistics
     let (mean, min, max, stddev) = calculate_sample_stats(&run_latencies_ms);
-    assert!(min <= mean && mean <= max, "min ({min}) <= mean ({mean}) <= max ({max})");
+    assert!(
+        min <= mean && mean <= max,
+        "min ({min}) <= mean ({mean}) <= max ({max})"
+    );
     assert!(stddev >= 0.0, "stddev must be non-negative: {stddev}");
 
     // 6. Clean Teardown Verification
@@ -200,7 +205,10 @@ fn test_us02_coordination_profiles_comparative_forward_pass() {
         assert_eq!(summary.prompt_tokens, 3);
         assert_eq!(summary.generated_tokens.len(), max_tokens);
         assert_eq!(summary.timing.decode_steps, 3);
-        assert!(summary.timing.ttft_ms > 0.0, "TTFT must be positive for {profile}");
+        assert!(
+            summary.timing.ttft_ms > 0.0,
+            "TTFT must be positive for {profile}"
+        );
         assert!(
             summary.timing.decode_tokens_per_sec > 0.0,
             "decode throughput must be positive for {profile}"
@@ -219,8 +227,7 @@ fn test_us02_coordination_profiles_comparative_forward_pass() {
             "compute utilization ratio within [0.0, 1.0] for {profile}"
         );
         assert!(
-            summary.timing.barrier_wait_ratio >= 0.0
-                && summary.timing.barrier_wait_ratio <= 1.0,
+            summary.timing.barrier_wait_ratio >= 0.0 && summary.timing.barrier_wait_ratio <= 1.0,
             "barrier wait ratio within [0.0, 1.0] for {profile}"
         );
 
