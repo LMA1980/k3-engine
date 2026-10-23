@@ -8,13 +8,17 @@
 use std::collections::HashMap;
 use std::io::Write;
 
-use k3_core::{GgufFile, K3Error};
+use k3_core::{
+    ClusterPlacement, CoreAllocation, CostProfile, ExecutionCost, GgufFile, K3Error,
+    MemoryFootprintProfile, ModelIdentity, QuantizationInfo, TuningAdvisory,
+};
 use k3_engine::affinity::{ClusterPreset, ResolvedAffinity, SplitStrategy, WorkerAffinityStatus};
 use k3_engine::forward::{
     CalibrationShape, ForwardModel, ForwardSummary, Lane, MatKernel, PhaseLayout, PlacementPlan,
     calibrate_matmul_rate, measure_memory_bandwidth, measure_peak_macs, probe_ime_on_core,
     row_split_share,
 };
+use k3_engine::memory::calculate_footprint;
 use k3_engine::{
     A100_CLUSTER_MASK, LockedModelWeights, SystemMemoryInspector, WorkerPool, X100_CLUSTER_MASK,
 };
@@ -27,17 +31,43 @@ use crate::{DiagConfig, MetricStats, RunMetric, StatisticsSummary, is_abort_requ
 /// determinism check can be shown to catch a violation.
 const FAULT_ENV: &str = "K3_DIAG_INJECT_NONDETERMINISM";
 
-/// Per-phase latency, throughput and hardware-ceiling attainment (ADR-034).
+/// Per-phase latency, throughput, cost per token and hardware-ceiling attainment (ADR-034, US-04).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PhaseReport {
     pub(crate) latency_ms: f64,
     pub(crate) tokens_per_sec: f64,
+    pub(crate) cost_per_token_ms: f64,
     /// Achieved fraction of the phase's hardware ceiling in percent (informational, no threshold).
     pub(crate) ceiling_pct: f64,
     /// Ceiling definition: `peak_macs` (prefill) or `memory_bandwidth` (decode).
     pub(crate) ceiling_metric: String,
     /// Measured ceiling value (`MAC/s` or `bytes/s`).
     pub(crate) ceiling_value: f64,
+}
+
+fn measure_peak_resident_bytes() -> u64 {
+    if let Ok(content) = std::fs::read_to_string("/proc/self/status") {
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("VmHWM:") {
+                if let Some(kb_str) = rest.split_whitespace().next() {
+                    if let Ok(kb) = kb_str.parse::<u64>() {
+                        return kb.saturating_mul(1024);
+                    }
+                }
+            }
+        }
+    }
+    // SAFETY: zeroed rusage struct is safely initialized for C getrusage.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: standard getrusage query
+    let ret = unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut usage) };
+    if ret == 0 {
+        #[cfg(target_os = "macos")]
+        return usage.ru_maxrss as u64;
+        #[cfg(not(target_os = "macos"))]
+        return (usage.ru_maxrss as u64).saturating_mul(1024);
+    }
+    0
 }
 
 /// Throughput of one IME arm, as it appears inside the comparison.
@@ -138,11 +168,14 @@ pub(crate) struct MatrixBenchReport {
     pub(crate) decode: PhaseReport,
     pub(crate) prefill_latency_ms: f64,
     pub(crate) decode_latency_ms: f64,
+    pub(crate) prefill_cost_per_token_ms: f64,
+    pub(crate) decode_cost_per_token_ms: f64,
     pub(crate) prefill_tps: f64,
     pub(crate) decode_tps: f64,
     pub(crate) prefill_hardware_ceiling_pct: f64,
     pub(crate) decode_hardware_ceiling_pct: f64,
     pub(crate) total_wall_time_ms: f64,
+    pub(crate) cost_profile: CostProfile,
     pub(crate) ime_vmadot_issued: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) ime_delta_prefill_tps: Option<f64>,
@@ -519,9 +552,20 @@ pub(crate) fn run_matrix_benchmark<W: Write>(
             0.0
         }
     };
+    let prefill_cost_per_token_ms = if prompt_tokens.is_empty() {
+        0.0
+    } else {
+        prefill_ms / prompt_tokens.len() as f64
+    };
+    let decode_cost_per_token_ms = if tokens0.is_empty() {
+        0.0
+    } else {
+        decode_ms / tokens0.len() as f64
+    };
     let prefill = PhaseReport {
         latency_ms: prefill_ms,
         tokens_per_sec: prefill_tps_mean,
+        cost_per_token_ms: prefill_cost_per_token_ms,
         ceiling_pct: pct(prefill_macs_per_sec, prefill_peak),
         ceiling_metric: "peak_macs".to_owned(),
         ceiling_value: prefill_peak,
@@ -529,6 +573,7 @@ pub(crate) fn run_matrix_benchmark<W: Write>(
     let decode = PhaseReport {
         latency_ms: decode_ms,
         tokens_per_sec: decode_tps_mean,
+        cost_per_token_ms: decode_cost_per_token_ms,
         ceiling_pct: pct(decode_bytes_per_sec, decode_bw),
         ceiling_metric: "memory_bandwidth".to_owned(),
         ceiling_value: decode_bw,
@@ -592,6 +637,165 @@ pub(crate) fn run_matrix_benchmark<W: Write>(
         .clone()
         .unwrap_or_else(|| affinity.cluster.map_or("x100", |c| c.as_str()).to_owned());
     let split_name = config.split.map(|s| s.as_str().to_owned());
+
+    let footprint = calculate_footprint(locked_weights.metadata(), n_ctx)?;
+    let measured_rss = measure_peak_resident_bytes();
+    let peak_resident_bytes = measured_rss.max(footprint.total_required_bytes);
+
+    let model_name = gguf_view
+        .metadata_value("general.name")
+        .and_then(|v| v.as_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            std::path::Path::new(model_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_owned()
+        });
+
+    let model_identity = ModelIdentity {
+        name: model_name,
+        architecture: gguf_view.architecture().to_owned(),
+        file_path: model_path.to_owned(),
+        file_digest: format!("{seed:016x}"),
+    };
+
+    let quantization_level =
+        QuantizationInfo::from_descriptors(locked_weights.metadata().tensors());
+
+    let split_strategy_str = split_name
+        .clone()
+        .unwrap_or_else(|| "none".to_owned());
+
+    let cluster_placement = ClusterPlacement {
+        cluster: cluster.clone(),
+        effective_core_mask: format!("0x{:04X}", affinity.effective_mask),
+        allocated_cores: affinity.threads,
+        x100_cores: affinity.x100_cores.len(),
+        a100_cores: affinity.a100_cores.len(),
+        coordination_profile: profile.as_str().to_owned(),
+        split_strategy: split_strategy_str.clone(),
+        ime: if ime_on { "on" } else { "off" }.to_owned(),
+    };
+
+    let allocated_cores = CoreAllocation {
+        total: affinity.threads,
+        total_cores: affinity.threads,
+        x100_cores: affinity.x100_cores.len(),
+        a100_cores: affinity.a100_cores.len(),
+        effective_mask: format!("0x{:04X}", affinity.effective_mask),
+    };
+
+    let static_scheduling_weight = if decode_cost_per_token_ms > 0.0 {
+        decode_cost_per_token_ms
+    } else {
+        prefill_cost_per_token_ms.max(1.0)
+    };
+
+    let execution_cost = ExecutionCost {
+        prefill_cost_per_token_ms,
+        prefill_tokens_per_sec: prefill_tps_mean,
+        prefill_hardware_ceiling_pct: prefill.ceiling_pct,
+        decode_cost_per_token_ms,
+        decode_tokens_per_sec: decode_tps_mean,
+        decode_hardware_ceiling_pct: decode.ceiling_pct,
+        static_scheduling_weight,
+    };
+
+    let memory_footprint = MemoryFootprintProfile {
+        weight_bytes: footprint.weight_bytes,
+        kv_bytes: footprint.kv_bytes,
+        total_required_bytes: footprint.total_required_bytes,
+        peak_resident_bytes,
+    };
+
+    let (bottleneck_classification, recommended_cluster, recommended_split, recommended_ime, rationale, recommendations) = {
+        let bottleneck = if decode.ceiling_pct >= prefill.ceiling_pct {
+            "bandwidth-bound"
+        } else {
+            "compute-bound"
+        };
+
+        let (rec_cluster, rec_split, rec_ime) = match cluster.as_str() {
+            "x100" => {
+                if quantization_level.primary == "Q4_K_M" || quantization_level.primary == "Q8_0" {
+                    ("both".to_owned(), Some("phase".to_owned()), true)
+                } else {
+                    ("a100".to_owned(), None, true)
+                }
+            }
+            "a100" => ("a100".to_owned(), None, true),
+            "both" => (
+                "both".to_owned(),
+                config.split.map(|s| s.as_str().to_owned()).or_else(|| Some("phase".to_owned())),
+                true,
+            ),
+            _ => ("both".to_owned(), Some("phase".to_owned()), true),
+        };
+
+        let rat = format!(
+            "Evaluation indicates {bottleneck} execution: prefill achieved {:.1}% of theoretical compute capacity (peak_macs), while decode achieved {:.1}% of memory bandwidth capacity.",
+            prefill.ceiling_pct, decode.ceiling_pct
+        );
+
+        let mut recs = Vec::new();
+        if bottleneck == "bandwidth-bound" {
+            recs.push("Autoregressive token decode is memory bandwidth-bound; consider low-bit quantization (e.g. Q4_K_M) to reduce per-token memory traffic.".to_owned());
+        } else {
+            recs.push("Prompt prefill is compute-bound; offload prefill matrix multiplies to Cluster 1 (A100) with SpacemiT IME matrix acceleration enabled.".to_owned());
+        }
+        if !ime_on {
+            recs.push("SpacemiT IME (XSMTVDotII / smt.vmadot) matrix acceleration is currently disabled; enable '--ime on' to accelerate matrix operations.".to_owned());
+        }
+        if cluster == "x100" {
+            recs.push("Evaluating '--cluster both --split phase' leverages A100 matrix acceleration for prefill while reserving X100 for sequential decode.".to_owned());
+        }
+        recs.push("Operator tuning authority (ADR-032): These recommendations are advisory only; operator configuration remains authoritative.".to_owned());
+
+        (bottleneck.to_owned(), rec_cluster, rec_split, rec_ime, rat, recs)
+    };
+
+    let tuning_advisory = TuningAdvisory {
+        bottleneck_classification,
+        recommended_cluster,
+        recommended_split,
+        recommended_ime,
+        rationale,
+        recommendations,
+        operator_authority_notice: "Advisory recommendation only per ADR-032. Operator configuration and tuning-profile remain authoritative.".to_owned(),
+    };
+
+    let cost_profile = CostProfile {
+        model_identity,
+        quantization_level,
+        cluster_placement,
+        allocated_cores,
+        split_strategy: split_strategy_str,
+        execution_cost,
+        prefill_cost_per_token_ms,
+        prefill_tokens_per_sec: prefill_tps_mean,
+        prefill_hardware_ceiling_pct: prefill.ceiling_pct,
+        decode_tokens_per_sec: decode_tps_mean,
+        decode_cost_per_token_ms,
+        decode_hardware_ceiling_pct: decode.ceiling_pct,
+        static_scheduling_weight,
+        scheduling_weight: static_scheduling_weight,
+        memory_footprint,
+        weight_bytes: footprint.weight_bytes,
+        kv_bytes: footprint.kv_bytes,
+        total_required_bytes: footprint.total_required_bytes,
+        peak_resident_bytes,
+        tuning_advisory,
+    };
+
+    if let Some(export_path) = &config.export_profile {
+        let json_str = serde_json::to_string_pretty(&cost_profile)
+            .map_err(|e| cap_err("json", format!("failed to serialize cost profile: {e}")))?;
+        std::fs::write(export_path, json_str)
+            .map_err(|e| cap_err("io", format!("failed to write cost profile to '{export_path}': {e}")))?;
+    }
+
     let report = MatrixBenchReport {
         mode: "matrix-benchmark".to_owned(),
         cluster,
@@ -610,11 +814,14 @@ pub(crate) fn run_matrix_benchmark<W: Write>(
         generated_tokens: tokens0.len(),
         prefill_latency_ms: prefill.latency_ms,
         decode_latency_ms: decode.latency_ms,
+        prefill_cost_per_token_ms,
+        decode_cost_per_token_ms,
         prefill_tps: prefill.tokens_per_sec,
         decode_tps: decode.tokens_per_sec,
         prefill_hardware_ceiling_pct: prefill.ceiling_pct,
         decode_hardware_ceiling_pct: decode.ceiling_pct,
         total_wall_time_ms: statistics.total_wall_time_ms.mean,
+        cost_profile,
         prefill,
         decode,
         ime_vmadot_issued: primary.summaries.iter().map(|s| s.vmadot_issued).sum(),
@@ -687,16 +894,21 @@ fn write_table<W: Write>(out: &mut W, r: &MatrixBenchReport) {
     );
     let _ = writeln!(
         out,
-        "Prefill              : {:.3} ms, {:.1} tok/s, {:.1}% of {} ceiling",
+        "Prefill              : {:.3} ms, {:.1} tok/s, {:.3} ms/token, {:.1}% of {} ceiling",
         r.prefill.latency_ms,
         r.prefill.tokens_per_sec,
+        r.prefill.cost_per_token_ms,
         r.prefill.ceiling_pct,
         r.prefill.ceiling_metric
     );
     let _ = writeln!(
         out,
-        "Decode               : {:.3} ms, {:.1} tok/s, {:.1}% of {} ceiling",
-        r.decode.latency_ms, r.decode.tokens_per_sec, r.decode.ceiling_pct, r.decode.ceiling_metric
+        "Decode               : {:.3} ms, {:.1} tok/s, {:.3} ms/token, {:.1}% of {} ceiling",
+        r.decode.latency_ms,
+        r.decode.tokens_per_sec,
+        r.decode.cost_per_token_ms,
+        r.decode.ceiling_pct,
+        r.decode.ceiling_metric
     );
     if let Some(rs) = &r.row_split {
         let _ = writeln!(
@@ -712,5 +924,36 @@ fn write_table<W: Write>(out: &mut W, r: &MatrixBenchReport) {
             c.delta_prefill_tps, c.delta_prefill_pct, c.delta_decode_tps, c.delta_decode_pct
         );
     }
+    let _ = writeln!(out, "----------------------------------------------------------");
+    let _ = writeln!(out, "Cost Profile Baseline (US-04):");
+    let _ = writeln!(
+        out,
+        "  Prefill Cost       : {:.3} ms/token ({:.1}% of peak_macs)",
+        r.cost_profile.prefill_cost_per_token_ms, r.cost_profile.prefill_hardware_ceiling_pct
+    );
+    let _ = writeln!(
+        out,
+        "  Decode Cost        : {:.3} ms/token ({:.1}% of memory_bandwidth)",
+        r.cost_profile.decode_cost_per_token_ms, r.cost_profile.decode_hardware_ceiling_pct
+    );
+    let _ = writeln!(
+        out,
+        "  Static Sched Weight: {:.3}",
+        r.cost_profile.static_scheduling_weight
+    );
+    let _ = writeln!(
+        out,
+        "  Peak Resident RAM  : {} bytes (weights: {}, kv: {})",
+        r.cost_profile.peak_resident_bytes,
+        r.cost_profile.weight_bytes,
+        r.cost_profile.kv_bytes
+    );
+    let _ = writeln!(
+        out,
+        "  Tuning Advisory    : {} (Cluster: {}, IME: {})",
+        r.cost_profile.tuning_advisory.bottleneck_classification,
+        r.cost_profile.tuning_advisory.recommended_cluster,
+        if r.cost_profile.tuning_advisory.recommended_ime { "on" } else { "off" }
+    );
     let _ = writeln!(out, "{rule}");
 }

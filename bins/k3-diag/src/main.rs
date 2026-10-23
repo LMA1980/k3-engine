@@ -87,6 +87,10 @@ pub struct DiagConfig {
     pub repeat: Option<usize>,
     /// Emit structured JSON export.
     pub json: bool,
+    /// Path to export machine-readable CostProfile JSON baseline (US-04).
+    pub export_profile: Option<String>,
+    /// Explicit human-readable benchmark summary request.
+    pub summary: bool,
 }
 
 impl Default for DiagConfig {
@@ -104,6 +108,8 @@ impl Default for DiagConfig {
             coord: None,
             repeat: None,
             json: false,
+            export_profile: None,
+            summary: false,
         }
     }
 }
@@ -257,6 +263,15 @@ impl DiagConfig {
                 "--json" => {
                     config.json = true;
                 }
+                "--export-profile" => {
+                    config.export_profile = Some(
+                        args.next()
+                            .ok_or_else(|| "--export-profile requires a file path".to_owned())?,
+                    );
+                }
+                "--summary" | "--bench" => {
+                    config.summary = true;
+                }
                 unknown => {
                     return Err(format!("unknown option '{unknown}'"));
                 }
@@ -277,14 +292,16 @@ impl DiagConfig {
         Ok(Some(config))
     }
 
-    /// Returns `true` when the US-03 matrix-forward benchmark (cluster placement, split and IME
-    /// comparison) should run instead of the US-01/US-02 recipe evaluation.
+    /// Returns `true` when the matrix-forward benchmark / hardware ceiling profiling should run.
     #[must_use]
     pub fn is_matrix_benchmark(&self) -> bool {
         self.split.is_some()
             || self.ime.is_some()
             || self.cluster.as_deref() == Some("both")
+            || self.export_profile.is_some()
+            || self.summary
             || (self.cluster.is_some() && self.json)
+            || (self.cluster.is_some() && self.core_mask.is_none())
     }
 }
 
@@ -400,6 +417,8 @@ fn print_usage() {
                --coord <strategy> Multi-core coordination profile ('spin', 'futex', 'rayon')\n  \
                --repeat <n>       Repeat benchmark iterations (N >= 3) for jitter measurement\n  \
                --json             Emit structured machine-readable JSON report\n  \
+               --export-profile <path> Export structured CostProfile JSON to file\n  \
+               --summary          Emit human-readable summary table\n  \
            -h, --help             Show this help message\n  \
            -v, --version          Show version information"
     );
@@ -940,6 +959,8 @@ mod tests {
             coord: None,
             repeat: None,
             json: false,
+            export_profile: None,
+            summary: false,
         };
 
         let mut output_buf = Vec::new();
@@ -978,6 +999,8 @@ mod tests {
             coord: Some(CoordinationProfile::Spin),
             repeat: Some(3),
             json: true,
+            export_profile: None,
+            summary: false,
         };
 
         let mut output_buf = Vec::new();
