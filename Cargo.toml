@@ -15,6 +15,8 @@ arch-synthetic = { workspace = true, optional = true }
 k3-core = { workspace = true }
 kernels-rvv = { workspace = true, optional = true }
 libc = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 k3-tokenizer = { workspace = true }

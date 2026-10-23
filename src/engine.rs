@@ -5,6 +5,7 @@
 //! and invokes an unbuffered streaming callback on every generated token.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use k3_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights};
 
@@ -33,8 +34,70 @@ pub enum StreamAction {
     Stop,
 }
 
+/// Execution timing, throughput, and synchronization barrier wait metrics for a single forward pass.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PassTiming {
+    /// Time to First Token (TTFT) in milliseconds: duration from prompt prefill start
+    /// until the greedy argmax sampling of the first generated token.
+    pub ttft_ms: f64,
+    /// Wall-clock duration of the prompt prefill phase in milliseconds.
+    pub prefill_ms: f64,
+    /// Wall-clock duration of the autoregressive decode phase in milliseconds.
+    pub decode_ms: f64,
+    /// Decode generation throughput in tokens per second.
+    /// Calculated as `decode_steps / (decode_ms / 1000.0)`.
+    /// Evaluates to `0.0` if no decode tokens were generated (`decode_steps == 0`).
+    pub decode_tokens_per_sec: f64,
+    /// Total wall-clock execution duration of the forward pass in milliseconds (`prefill_ms + decode_ms`).
+    pub total_wall_time_ms: f64,
+    /// Cumulative inter-worker barrier wait overhead in milliseconds, aggregated across all assigned worker threads.
+    pub cumulative_barrier_wait_ms: f64,
+    /// Ratio of cumulative barrier wait overhead to total available worker CPU time (`cumulative_barrier_wait_ms / (total_wall_time_ms * num_workers)`).
+    /// Clamped to `[0.0, 1.0]`.
+    pub barrier_wait_ratio: f64,
+    /// Ratio of active compute utilization across assigned cores (`1.0 - barrier_wait_ratio`).
+    /// Clamped to `[0.0, 1.0]`.
+    pub compute_utilization_ratio: f64,
+    /// Number of decode steps executed.
+    pub decode_steps: usize,
+}
+
+impl Default for PassTiming {
+    fn default() -> Self {
+        Self {
+            ttft_ms: 0.0,
+            prefill_ms: 0.0,
+            decode_ms: 0.0,
+            decode_tokens_per_sec: 0.0,
+            total_wall_time_ms: 0.0,
+            cumulative_barrier_wait_ms: 0.0,
+            barrier_wait_ratio: 0.0,
+            compute_utilization_ratio: 1.0,
+            decode_steps: 0,
+        }
+    }
+}
+
+impl PassTiming {
+    /// Creates a zeroed [`PassTiming`] instance.
+    #[must_use]
+    pub const fn zero() -> Self {
+        Self {
+            ttft_ms: 0.0,
+            prefill_ms: 0.0,
+            decode_ms: 0.0,
+            decode_tokens_per_sec: 0.0,
+            total_wall_time_ms: 0.0,
+            cumulative_barrier_wait_ms: 0.0,
+            barrier_wait_ratio: 0.0,
+            compute_utilization_ratio: 1.0,
+            decode_steps: 0,
+        }
+    }
+}
+
 /// Summary statistics and generated token sequence from a completed single-prompt evaluation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EvaluationSummary {
     /// Number of prompt tokens processed during prefill.
     pub prompt_tokens: usize,
@@ -44,6 +107,8 @@ pub struct EvaluationSummary {
     pub final_position: usize,
     /// Final state machine phase (`EnginePhase::Completed`).
     pub final_phase: EnginePhase,
+    /// Phase-level execution timing and synchronization barrier wait metrics.
+    pub timing: PassTiming,
 }
 
 /// Single-slot forward-pass orchestrator enforcing strict cycle exclusivity (ADR-005, US-01.6.1).
@@ -148,7 +213,7 @@ impl SinglePromptEngine {
     /// - Returns [`K3Error::CapabilityMismatch`] if another prompt is already active (ADR-005)
     ///   or if `prompt_tokens` / `vocab_size` is empty.
     /// - Returns [`K3Error::ContextLengthExceeded`] if `prompt_tokens.len() > kv_arena.n_ctx()`.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cast_precision_loss)]
     pub fn evaluate_prompt_with_pool<F>(
         &mut self,
         recipe: &dyn ArchRecipe,
@@ -184,8 +249,14 @@ impl SinglePromptEngine {
         let mut ctx =
             ExecutionContext::new(prompt_tokens, n_ctx, &mut logits, kv_arena.as_mut_slice())?;
 
+        let pass_start = Instant::now();
+        if let Some(pool) = worker_pool {
+            pool.reset_barrier_wait();
+        }
+
         // 1. Transition Idle -> Prefill
         self.phase = EnginePhase::Prefill;
+        let prefill_start = Instant::now();
         if let Some(pool) = worker_pool {
             pool.execute(|_worker_idx, _total_workers| {
                 // Synchronize pinned worker threads on prefill barrier
@@ -195,21 +266,36 @@ impl SinglePromptEngine {
 
         let mut generated_tokens = Vec::with_capacity(max_tokens);
         if max_tokens == 0 {
+            let prefill_elapsed = prefill_start.elapsed();
+            let ttft_ms = prefill_elapsed.as_secs_f64() * 1000.0;
+            let prefill_ms = ttft_ms;
             self.phase = EnginePhase::Completed;
             return Ok(EvaluationSummary {
                 prompt_tokens: prompt_tokens.len(),
                 generated_tokens,
                 final_position: ctx.position(),
                 final_phase: self.phase,
+                timing: compute_pass_timing(
+                    pass_start,
+                    ttft_ms,
+                    prefill_ms,
+                    0.0,
+                    0,
+                    0.0,
+                    worker_pool,
+                ),
             });
         }
 
-        // Sample first token produced by prefill logits
+        // Sample first token produced by prefill logits (TTFT ends here)
         let mut current_token =
             sample_greedy_argmax(ctx.logits()).ok_or_else(|| K3Error::CapabilityMismatch {
                 architecture: recipe.architecture_id().to_owned(),
                 reason: "empty logits buffer after prefill step".to_owned(),
             })?;
+        let prefill_elapsed = prefill_start.elapsed();
+        let ttft_ms = prefill_elapsed.as_secs_f64() * 1000.0;
+        let prefill_ms = ttft_ms;
 
         generated_tokens.push(current_token);
         if on_token(current_token)? == StreamAction::Stop {
@@ -219,11 +305,23 @@ impl SinglePromptEngine {
                 generated_tokens,
                 final_position: ctx.position(),
                 final_phase: self.phase,
+                timing: compute_pass_timing(
+                    pass_start,
+                    ttft_ms,
+                    prefill_ms,
+                    0.0,
+                    0,
+                    0.0,
+                    worker_pool,
+                ),
             });
         }
 
         // 2. Transition Prefill -> Decode
         self.phase = EnginePhase::Decode;
+        let decode_start = Instant::now();
+        let mut decode_steps = 0usize;
+
         while generated_tokens.len() < max_tokens && ctx.position() < n_ctx {
             ctx.prepare_decode(current_token)?;
             if let Some(pool) = worker_pool {
@@ -240,10 +338,20 @@ impl SinglePromptEngine {
                 })?;
 
             generated_tokens.push(current_token);
+            decode_steps += 1;
             if on_token(current_token)? == StreamAction::Stop {
                 break;
             }
         }
+
+        let decode_duration = decode_start.elapsed();
+        let decode_ms = decode_duration.as_secs_f64() * 1000.0;
+        let decode_duration_secs = decode_duration.as_secs_f64();
+        let decode_tokens_per_sec = if decode_duration_secs > 0.0 && decode_steps > 0 {
+            decode_steps as f64 / decode_duration_secs
+        } else {
+            0.0
+        };
 
         self.phase = EnginePhase::Completed;
         Ok(EvaluationSummary {
@@ -251,7 +359,51 @@ impl SinglePromptEngine {
             generated_tokens,
             final_position: ctx.position(),
             final_phase: self.phase,
+            timing: compute_pass_timing(
+                pass_start,
+                ttft_ms,
+                prefill_ms,
+                decode_ms,
+                decode_steps,
+                decode_tokens_per_sec,
+                worker_pool,
+            ),
         })
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn compute_pass_timing(
+    pass_start: Instant,
+    ttft_ms: f64,
+    prefill_ms: f64,
+    decode_ms: f64,
+    decode_steps: usize,
+    decode_tokens_per_sec: f64,
+    worker_pool: Option<&WorkerPool>,
+) -> PassTiming {
+    let total_wall_time_ms = pass_start.elapsed().as_secs_f64() * 1000.0;
+    let cumulative_barrier_wait_ms =
+        worker_pool.map_or(0.0, WorkerPool::cumulative_barrier_wait_ms);
+    let worker_count = worker_pool.map_or(1, WorkerPool::thread_count);
+    let total_core_time_ms = total_wall_time_ms * (worker_count as f64);
+    let barrier_wait_ratio = if total_core_time_ms > 0.0 {
+        (cumulative_barrier_wait_ms / total_core_time_ms).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let compute_utilization_ratio = (1.0 - barrier_wait_ratio).clamp(0.0, 1.0);
+
+    PassTiming {
+        ttft_ms,
+        prefill_ms,
+        decode_ms,
+        decode_tokens_per_sec,
+        total_wall_time_ms,
+        cumulative_barrier_wait_ms,
+        barrier_wait_ratio,
+        compute_utilization_ratio,
+        decode_steps,
     }
 }
 
@@ -313,6 +465,59 @@ mod tests {
         assert_eq!(summary.final_position, 3 + 3); // 3 prefill + 3 decode steps = 6
         assert_eq!(summary.final_phase, EnginePhase::Completed);
         assert!(!engine.is_busy());
+
+        // Phase timing instrumentation validation
+        assert!(summary.timing.ttft_ms >= 0.0);
+        assert!(summary.timing.total_wall_time_ms >= summary.timing.ttft_ms);
+        assert_eq!(summary.timing.decode_steps, 3);
+        assert!(summary.timing.decode_tokens_per_sec >= 0.0);
+        assert_eq!(summary.timing.cumulative_barrier_wait_ms, 0.0);
+        assert_eq!(summary.timing.barrier_wait_ratio, 0.0);
+        assert_eq!(summary.timing.compute_utilization_ratio, 1.0);
+    }
+
+    #[cfg(feature = "arch-synthetic")]
+    #[test]
+    fn test_phase_timing_metrics_in_single_prompt_engine() {
+        use arch_synthetic::SyntheticRecipe;
+
+        let tensor_specs = [
+            ("blk.0.attn_q.weight", QuantType::Q4_K_M, &[256, 2][..]),
+            ("output_norm.weight", QuantType::F32, &[16][..]),
+        ];
+        let bytes = create_synthetic_gguf_v3("synthetic", 32, &tensor_specs);
+        let gguf = GgufFile::parse(&bytes).expect("parse gguf");
+        let recipe = SyntheticRecipe::new();
+
+        // 1. max_tokens = 0 (prefill only)
+        let mut kv_arena = SingleSlotKvArena::new(gguf.metadata(), 32).expect("kv arena");
+        let mut engine = SinglePromptEngine::new();
+        let summary_0 = engine
+            .evaluate_prompt(&recipe, &gguf, &mut kv_arena, &[1, 9, 10], 16, 0, |_| {
+                Ok(StreamAction::Continue)
+            })
+            .expect("eval 0");
+        assert_eq!(summary_0.generated_tokens.len(), 0);
+        assert_eq!(summary_0.timing.decode_steps, 0);
+        assert_eq!(summary_0.timing.decode_tokens_per_sec, 0.0);
+        assert!(summary_0.timing.ttft_ms >= 0.0);
+
+        // 2. max_tokens = 1 (prefill + first token sample, zero decode steps)
+        let mut kv_arena = SingleSlotKvArena::new(gguf.metadata(), 32).expect("kv arena");
+        let summary_1 = engine
+            .evaluate_prompt(&recipe, &gguf, &mut kv_arena, &[1, 9, 10], 16, 1, |_| {
+                Ok(StreamAction::Continue)
+            })
+            .expect("eval 1");
+        assert_eq!(summary_1.generated_tokens.len(), 1);
+        assert_eq!(summary_1.timing.decode_steps, 0);
+        assert_eq!(summary_1.timing.decode_tokens_per_sec, 0.0);
+        assert!(summary_1.timing.ttft_ms >= 0.0);
+
+        // 3. PassTiming zero and default
+        let zero_timing = PassTiming::zero();
+        assert_eq!(zero_timing, PassTiming::default());
+        assert_eq!(zero_timing.compute_utilization_ratio, 1.0);
     }
 
     #[test]

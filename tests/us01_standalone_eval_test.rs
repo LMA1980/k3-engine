@@ -72,7 +72,7 @@ fn test_us01_scenario_1_direct_local_evaluation_and_realtime_token_streaming() {
     let prompt_tokens = tokenizer
         .tokenize_prompt("Explain RVV 1.0", true, n_ctx)
         .expect("format and tokenize prompt");
-    assert!(!prompt_tokens.is_empty());
+    assert!(!prompt_tokens.is_empty(), "prompt tokens must not be empty");
 
     // 4. Execute isolated single-prompt forward pass and verify progressive token-by-token streaming
     let mut engine = SinglePromptEngine::new();

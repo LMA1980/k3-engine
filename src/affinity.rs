@@ -5,10 +5,12 @@
 //! VLEN migration (ADR-007, ADR-008, `core-affinity.md`, US-01 Scenario 2).
 
 use std::fs;
-use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
-use k3_core::K3Error;
+use k3_core::{CoordinationProfile, K3Error};
 
 /// Core bitmask for Cluster 0 (`X100` `OoO` cores 0–7, `zvl256b`).
 pub const X100_CLUSTER_MASK: u64 = 0x00FF;
@@ -477,35 +479,272 @@ struct PoolSharedState {
     shutdown: bool,
 }
 
-/// Affinity-pinned multi-core compute worker pool (US-01.5.2, US-01 Scenario 2).
+/// Cache-line aligned (64-byte) per-worker barrier wait accumulator (US-02 R1, ADR-006).
 ///
-/// Spawns exactly `N` persistent worker threads at initialization, pins each worker 1-to-1 to its
-/// assigned physical core via `libc::sched_setaffinity`, and verifies zero cross-cluster migration.
+/// Prevents cross-core cache line false sharing on `SpacemiT` K3 L1/L2 caches when multiple
+/// pinned worker threads concurrently accumulate barrier wait times.
+#[repr(align(64))]
+#[derive(Debug, Default)]
+pub struct WorkerWaitSlot {
+    /// Cumulative barrier wait duration in nanoseconds.
+    accumulated_nanos: AtomicU64,
+    /// Number of barrier synchronization events recorded.
+    barrier_count: AtomicU64,
+}
+
+impl WorkerWaitSlot {
+    /// Creates a new zeroed wait slot.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            accumulated_nanos: AtomicU64::new(0),
+            barrier_count: AtomicU64::new(0),
+        }
+    }
+
+    /// Accumulates wait duration into this slot.
+    pub fn record_wait(&self, duration: Duration) {
+        let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        self.accumulated_nanos.fetch_add(nanos, Ordering::Relaxed);
+        self.barrier_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Accumulates wait duration in nanoseconds into this slot.
+    pub fn record_wait_nanos(&self, delta_nanos: u64) {
+        self.accumulated_nanos.fetch_add(delta_nanos, Ordering::Relaxed);
+        self.barrier_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns accumulated wait duration in nanoseconds.
+    #[must_use]
+    pub fn wait_nanos(&self) -> u64 {
+        self.accumulated_nanos.load(Ordering::Relaxed)
+    }
+
+    /// Returns accumulated wait duration in milliseconds.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn wait_ms(&self) -> f64 {
+        self.wait_nanos() as f64 / 1_000_000.0
+    }
+
+    /// Returns accumulated wait duration as a [`Duration`].
+    #[must_use]
+    pub fn wait_duration(&self) -> Duration {
+        Duration::from_nanos(self.wait_nanos())
+    }
+
+    /// Returns number of barrier events recorded.
+    #[must_use]
+    pub fn barrier_count(&self) -> u64 {
+        self.barrier_count.load(Ordering::Relaxed)
+    }
+
+    /// Resets accumulator and count to zero.
+    pub fn reset(&self) {
+        self.accumulated_nanos.store(0, Ordering::Relaxed);
+        self.barrier_count.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Sense-reversing atomic busy-polling barrier (US-02 R1).
+///
+/// Uses `core::hint::spin_loop()` for sub-microsecond synchronization between pinned worker cores.
+pub struct SpinBarrier {
+    num_threads: usize,
+    count: AtomicUsize,
+    generation: AtomicUsize,
+    sense: AtomicBool,
+}
+
+impl std::fmt::Debug for SpinBarrier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpinBarrier")
+            .field("num_threads", &self.num_threads)
+            .field("count", &self.count.load(Ordering::Relaxed))
+            .field("generation", &self.generation.load(Ordering::Relaxed))
+            .field("sense", &self.sense.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl SpinBarrier {
+    /// Creates a new spin barrier for `num_threads` participants.
+    #[must_use]
+    pub const fn new(num_threads: usize) -> Self {
+        Self {
+            num_threads,
+            count: AtomicUsize::new(0),
+            generation: AtomicUsize::new(0),
+            sense: AtomicBool::new(false),
+        }
+    }
+
+    /// Synchronizes calling thread. Returns elapsed wait duration spent spinning.
+    pub fn wait(&self, local_sense: &mut bool, shutdown: &AtomicBool) -> Duration {
+        if self.num_threads <= 1 {
+            return Duration::ZERO;
+        }
+
+        *local_sense = !*local_sense;
+        let expected_sense = *local_sense;
+        let start = Instant::now();
+
+        let arrival = self.count.fetch_add(1, Ordering::AcqRel);
+        if arrival + 1 == self.num_threads {
+            self.count.store(0, Ordering::Release);
+            self.generation.fetch_add(1, Ordering::Release);
+            self.sense.store(expected_sense, Ordering::Release);
+            Duration::ZERO
+        } else {
+            while self.sense.load(Ordering::Acquire) != expected_sense {
+                if shutdown.load(Ordering::Relaxed) {
+                    return Duration::ZERO;
+                }
+                core::hint::spin_loop();
+            }
+            start.elapsed()
+        }
+    }
+}
+
+/// Thread-sleep yielding barrier via [`Mutex`] and [`Condvar`] (US-02 R1).
+///
+/// Yields CPU cycles to the Linux kernel scheduler during inter-worker wait intervals.
+pub struct FutexBarrier {
+    num_threads: usize,
+    state: Mutex<FutexBarrierState>,
+    cvar: Condvar,
+}
+
+struct FutexBarrierState {
+    count: usize,
+    generation: usize,
+}
+
+impl std::fmt::Debug for FutexBarrier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FutexBarrier")
+            .field("num_threads", &self.num_threads)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FutexBarrier {
+    /// Creates a new futex barrier for `num_threads` participants.
+    #[must_use]
+    pub const fn new(num_threads: usize) -> Self {
+        Self {
+            num_threads,
+            state: Mutex::new(FutexBarrierState {
+                count: 0,
+                generation: 0,
+            }),
+            cvar: Condvar::new(),
+        }
+    }
+
+    /// Synchronizes calling thread yielding CPU cycles. Returns elapsed wait duration.
+    pub fn wait(&self, shutdown: &AtomicBool) -> Duration {
+        if self.num_threads <= 1 {
+            return Duration::ZERO;
+        }
+
+        let start = Instant::now();
+        let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current_gen = guard.generation;
+        guard.count += 1;
+        if guard.count == self.num_threads {
+            guard.count = 0;
+            guard.generation = guard.generation.wrapping_add(1);
+            self.cvar.notify_all();
+            Duration::ZERO
+        } else {
+            while guard.generation == current_gen && !shutdown.load(Ordering::Relaxed) {
+                guard = self.cvar.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            start.elapsed()
+        }
+    }
+
+    /// Notifies all waiting threads to wake immediately for shutdown.
+    pub fn notify_shutdown(&self) {
+        self.cvar.notify_all();
+    }
+}
+
+enum PoolBackend {
+    DedicatedThreads {
+        profile: CoordinationProfile,
+        state: Arc<(Mutex<PoolSharedState>, Condvar)>,
+        shutdown: Arc<AtomicBool>,
+        spin_barrier: Option<Arc<SpinBarrier>>,
+        futex_barrier: Option<Arc<FutexBarrier>>,
+        coordinator_sense: Arc<AtomicBool>,
+        handles: Vec<JoinHandle<()>>,
+    },
+    Rayon {
+        pool: rayon::ThreadPool,
+    },
+}
+
+impl std::fmt::Debug for PoolBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DedicatedThreads { profile, .. } => f
+                .debug_struct("DedicatedThreads")
+                .field("profile", profile)
+                .finish_non_exhaustive(),
+            Self::Rayon { .. } => f.debug_struct("Rayon").finish_non_exhaustive(),
+        }
+    }
+}
+
+/// Affinity-pinned multi-core compute worker pool (US-01.5.2, US-02 R1).
+///
+/// Supports three multi-core coordination profiles (`spin`, `futex`, `rayon`),
+/// pins workers 1-to-1 to physical cores, and instruments cumulative barrier wait times.
 pub struct WorkerPool {
     affinity: ResolvedAffinity,
+    profile: CoordinationProfile,
     worker_statuses: Vec<WorkerAffinityStatus>,
-    state: Arc<(Mutex<PoolSharedState>, Condvar)>,
-    completion_barrier: Arc<Barrier>,
-    handles: Vec<JoinHandle<()>>,
+    wait_slots: Arc<[WorkerWaitSlot]>,
+    backend: PoolBackend,
 }
 
 impl std::fmt::Debug for WorkerPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkerPool")
             .field("affinity", &self.affinity)
+            .field("profile", &self.profile)
             .field("worker_statuses", &self.worker_statuses)
+            .field("backend", &self.backend)
             .finish_non_exhaustive()
     }
 }
 
 impl WorkerPool {
-    /// Spawns a new [`WorkerPool`] with threads pinned 1-to-1 to `affinity.assigned_cores`.
+    /// Spawns a new [`WorkerPool`] using the default coordination profile ([`CoordinationProfile::Spin`]).
     ///
     /// # Errors
     ///
     /// Returns [`K3Error::AffinityError`] if thread creation, `sched_setaffinity`, or runtime
     /// affinity verification fails.
     pub fn new(affinity: ResolvedAffinity) -> Result<Self, K3Error> {
+        Self::new_with_profile(affinity, CoordinationProfile::Spin)
+    }
+
+    /// Spawns a new [`WorkerPool`] configured with a specific [`CoordinationProfile`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::AffinityError`] if thread creation, `sched_setaffinity`, or runtime
+    /// affinity verification fails.
+    #[allow(clippy::too_many_lines)]
+    pub fn new_with_profile(
+        affinity: ResolvedAffinity,
+        profile: CoordinationProfile,
+    ) -> Result<Self, K3Error> {
         let num_workers = affinity.threads;
         if num_workers == 0 || affinity.assigned_cores.len() != num_workers {
             return Err(K3Error::AffinityError {
@@ -516,106 +755,232 @@ impl WorkerPool {
             });
         }
 
-        let state = Arc::new((
-            Mutex::new(PoolSharedState {
-                generation: 0,
-                active_job: None,
-                shutdown: false,
-            }),
-            Condvar::new(),
-        ));
-        // num_workers + 1 coordinator thread
-        let completion_barrier = Arc::new(Barrier::new(num_workers + 1));
-        let (init_tx, init_rx) = mpsc::channel::<Result<WorkerAffinityStatus, K3Error>>();
+        let mut slots = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            slots.push(WorkerWaitSlot::new());
+        }
+        let wait_slots: Arc<[WorkerWaitSlot]> = slots.into();
 
-        let mut handles = Vec::with_capacity(num_workers);
+        match profile {
+            CoordinationProfile::Spin | CoordinationProfile::Futex => {
+                let state = Arc::new((
+                    Mutex::new(PoolSharedState {
+                        generation: 0,
+                        active_job: None,
+                        shutdown: false,
+                    }),
+                    Condvar::new(),
+                ));
+                let shutdown = Arc::new(AtomicBool::new(false));
+                let coordinator_sense = Arc::new(AtomicBool::new(false));
 
-        for (worker_index, &assigned_core) in affinity.assigned_cores.iter().enumerate() {
-            let state_clone = Arc::clone(&state);
-            let barrier_clone = Arc::clone(&completion_barrier);
-            let tx = init_tx.clone();
-            let req_mask = affinity.effective_mask;
+                let spin_barrier = if profile == CoordinationProfile::Spin {
+                    Some(Arc::new(SpinBarrier::new(num_workers + 1)))
+                } else {
+                    None
+                };
 
-            let handle = thread::Builder::new()
-                .name(format!("k3-worker-{worker_index}"))
-                .spawn(move || {
-                    let pin_result = pin_current_thread_and_verify(
-                        worker_index,
-                        assigned_core,
-                        req_mask,
-                        num_workers,
-                    );
-                    let is_ok = pin_result.is_ok();
-                    let _ = tx.send(pin_result);
-                    if !is_ok {
-                        return;
-                    }
+                let futex_barrier = if profile == CoordinationProfile::Futex {
+                    Some(Arc::new(FutexBarrier::new(num_workers + 1)))
+                } else {
+                    None
+                };
 
-                    let mut seen_gen = 0usize;
-                    loop {
-                        let job = {
-                            let (lock, cvar) = &*state_clone;
-                            let mut guard = lock
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            while !guard.shutdown && guard.generation == seen_gen {
-                                guard = cvar
-                                    .wait(guard)
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            }
-                            if guard.shutdown {
+                let (init_tx, init_rx) = mpsc::channel::<Result<WorkerAffinityStatus, K3Error>>();
+                let mut handles = Vec::with_capacity(num_workers);
+
+                for (worker_index, &assigned_core) in affinity.assigned_cores.iter().enumerate() {
+                    let state_clone = Arc::clone(&state);
+                    let shutdown_clone = Arc::clone(&shutdown);
+                    let spin_barrier_clone = spin_barrier.clone();
+                    let futex_barrier_clone = futex_barrier.clone();
+                    let wait_slots_clone = Arc::clone(&wait_slots);
+                    let tx = init_tx.clone();
+                    let req_mask = affinity.effective_mask;
+
+                    let handle = thread::Builder::new()
+                        .name(format!("k3-worker-{worker_index}"))
+                        .spawn(move || {
+                            let pin_result = pin_current_thread_and_verify(
+                                worker_index,
+                                assigned_core,
+                                req_mask,
+                                num_workers,
+                            );
+                            let is_ok = pin_result.is_ok();
+                            let _ = tx.send(pin_result);
+                            if !is_ok {
                                 return;
                             }
-                            seen_gen = guard.generation;
-                            guard.active_job.clone()
-                        };
 
-                        if let Some(work_fn) = job {
-                            work_fn(worker_index, num_workers);
-                        }
-                        barrier_clone.wait();
-                    }
-                })
-                .map_err(|err| K3Error::AffinityError {
-                    requested_mask: affinity.effective_mask,
-                    requested_threads: num_workers,
-                    reason: format!("failed to spawn worker thread {worker_index}: {err}"),
-                })?;
+                            let mut local_sense = false;
+                            let mut seen_gen = 0usize;
+                            loop {
+                                let (job, shutdown_flag) = {
+                                    let (lock, cvar) = &*state_clone;
+                                    let mut guard = lock
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    while !guard.shutdown
+                                        && !shutdown_clone.load(Ordering::Relaxed)
+                                        && guard.generation == seen_gen
+                                    {
+                                        guard = cvar
+                                            .wait(guard)
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    }
+                                    if guard.shutdown || shutdown_clone.load(Ordering::Relaxed) {
+                                        return;
+                                    }
+                                    seen_gen = guard.generation;
+                                    (guard.active_job.clone(), guard.shutdown)
+                                };
 
-            handles.push(handle);
-        }
-        drop(init_tx);
+                                if let Some(work_fn) = job {
+                                    work_fn(worker_index, num_workers);
+                                }
 
-        let mut worker_statuses = Vec::with_capacity(num_workers);
-        for _ in 0..num_workers {
-            match init_rx.recv() {
-                Ok(Ok(status)) => worker_statuses.push(status),
-                Ok(Err(err)) => {
-                    shutdown_workers(&state, &mut handles);
-                    return Err(err);
+                                if let Some(barrier) = &spin_barrier_clone {
+                                    let wait_time = barrier.wait(&mut local_sense, &shutdown_clone);
+                                    wait_slots_clone[worker_index].record_wait(wait_time);
+                                } else if let Some(barrier) = &futex_barrier_clone {
+                                    let wait_time = barrier.wait(&shutdown_clone);
+                                    wait_slots_clone[worker_index].record_wait(wait_time);
+                                }
+
+                                if shutdown_flag || shutdown_clone.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                            }
+                        })
+                        .map_err(|err| {
+                            shutdown_dedicated(&state, &shutdown, futex_barrier.as_ref(), &mut handles);
+                            K3Error::AffinityError {
+                                requested_mask: affinity.effective_mask,
+                                requested_threads: num_workers,
+                                reason: format!("failed to spawn worker thread {worker_index}: {err}"),
+                            }
+                        })?;
+
+                    handles.push(handle);
                 }
-                Err(recv_err) => {
-                    shutdown_workers(&state, &mut handles);
-                    return Err(K3Error::AffinityError {
+                drop(init_tx);
+
+                let mut worker_statuses = Vec::with_capacity(num_workers);
+                for _ in 0..num_workers {
+                    match init_rx.recv() {
+                        Ok(Ok(status)) => worker_statuses.push(status),
+                        Ok(Err(err)) => {
+                            shutdown_dedicated(&state, &shutdown, futex_barrier.as_ref(), &mut handles);
+                            return Err(err);
+                        }
+                        Err(recv_err) => {
+                            shutdown_dedicated(&state, &shutdown, futex_barrier.as_ref(), &mut handles);
+                            return Err(K3Error::AffinityError {
+                                requested_mask: affinity.effective_mask,
+                                requested_threads: num_workers,
+                                reason: format!(
+                                    "worker thread terminated before reporting affinity: {recv_err}"
+                                ),
+                            });
+                        }
+                    }
+                }
+
+                worker_statuses.sort_by_key(|s| s.worker_index);
+
+                Ok(Self {
+                    affinity,
+                    profile,
+                    worker_statuses,
+                    wait_slots,
+                    backend: PoolBackend::DedicatedThreads {
+                        profile,
+                        state,
+                        shutdown,
+                        spin_barrier,
+                        futex_barrier,
+                        coordinator_sense,
+                        handles,
+                    },
+                })
+            }
+            CoordinationProfile::Rayon => {
+                let (init_tx, init_rx) = mpsc::channel::<Result<WorkerAffinityStatus, K3Error>>();
+                let assigned_cores = affinity.assigned_cores.clone();
+                let req_mask = affinity.effective_mask;
+
+                let rayon_pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(num_workers)
+                    .thread_name(|i| format!("k3-rayon-worker-{i}"))
+                    .start_handler(move |worker_idx| {
+                        let assigned_core = assigned_cores[worker_idx];
+                        let res = pin_current_thread_and_verify(
+                            worker_idx,
+                            assigned_core,
+                            req_mask,
+                            num_workers,
+                        );
+                        let _ = init_tx.send(res);
+                    })
+                    .build()
+                    .map_err(|err| K3Error::AffinityError {
                         requested_mask: affinity.effective_mask,
                         requested_threads: num_workers,
-                        reason: format!(
-                            "worker thread terminated before reporting affinity: {recv_err}"
-                        ),
-                    });
+                        reason: format!("failed to initialize rayon thread pool: {err}"),
+                    })?;
+
+                let mut worker_statuses = Vec::with_capacity(num_workers);
+                for _ in 0..num_workers {
+                    match init_rx.recv() {
+                        Ok(Ok(status)) => worker_statuses.push(status),
+                        Ok(Err(err)) => return Err(err),
+                        Err(recv_err) => {
+                            return Err(K3Error::AffinityError {
+                                requested_mask: affinity.effective_mask,
+                                requested_threads: num_workers,
+                                reason: format!(
+                                    "rayon worker terminated prematurely: {recv_err}"
+                                ),
+                            });
+                        }
+                    }
                 }
+                worker_statuses.sort_by_key(|s| s.worker_index);
+
+                Ok(Self {
+                    affinity,
+                    profile,
+                    worker_statuses,
+                    wait_slots,
+                    backend: PoolBackend::Rayon { pool: rayon_pool },
+                })
             }
         }
+    }
 
-        worker_statuses.sort_by_key(|s| s.worker_index);
+    /// Spawns a new [`WorkerPool`] using the specified [`CoordinationProfile`] (alias for [`Self::new_with_profile`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::AffinityError`] if configuration or worker initialization fails.
+    pub fn with_coordination(
+        affinity: ResolvedAffinity,
+        coordination: CoordinationProfile,
+    ) -> Result<Self, K3Error> {
+        Self::new_with_profile(affinity, coordination)
+    }
 
-        Ok(Self {
-            affinity,
-            worker_statuses,
-            state,
-            completion_barrier,
-            handles,
-        })
+    /// Returns the active coordination profile for this pool.
+    #[must_use]
+    pub const fn profile(&self) -> CoordinationProfile {
+        self.profile
+    }
+
+    /// Returns the active coordination profile for this pool (alias for [`Self::profile`]).
+    #[must_use]
+    pub const fn coordination_profile(&self) -> CoordinationProfile {
+        self.profile
     }
 
     /// Returns the resolved affinity configuration for this pool.
@@ -634,6 +999,48 @@ impl WorkerPool {
     #[must_use]
     pub fn worker_statuses(&self) -> &[WorkerAffinityStatus] {
         &self.worker_statuses
+    }
+
+    /// Returns reference to per-worker wait slots.
+    #[must_use]
+    pub fn wait_slots(&self) -> &[WorkerWaitSlot] {
+        &self.wait_slots
+    }
+
+    /// Returns the wait slot reference for a given worker index.
+    #[must_use]
+    pub fn wait_slot(&self, worker_index: usize) -> &WorkerWaitSlot {
+        &self.wait_slots[worker_index]
+    }
+
+    /// Returns cumulative inter-worker barrier wait time across all workers in milliseconds.
+    #[must_use]
+    pub fn cumulative_barrier_wait_ms(&self) -> f64 {
+        self.wait_slots.iter().map(WorkerWaitSlot::wait_ms).sum()
+    }
+
+    /// Returns cumulative inter-worker barrier wait time across all workers in nanoseconds.
+    #[must_use]
+    pub fn cumulative_barrier_wait_nanos(&self) -> u64 {
+        self.wait_slots.iter().map(WorkerWaitSlot::wait_nanos).sum()
+    }
+
+    /// Returns cumulative inter-worker barrier wait duration across all workers.
+    #[must_use]
+    pub fn cumulative_barrier_wait(&self) -> Duration {
+        Duration::from_nanos(self.cumulative_barrier_wait_nanos())
+    }
+
+    /// Resets all per-worker barrier wait time accumulators.
+    pub fn reset_barrier_wait(&self) {
+        for slot in self.wait_slots.iter() {
+            slot.reset();
+        }
+    }
+
+    /// Resets all per-worker barrier wait time accumulators (alias for [`Self::reset_barrier_wait`]).
+    pub fn reset_wait_metrics(&self) {
+        self.reset_barrier_wait();
     }
 
     /// Re-reads `/proc/self/task/<tid>/status` (`Cpus_allowed_list`) for every active worker thread
@@ -676,37 +1083,99 @@ impl WorkerPool {
     where
         F: Fn(usize, usize) + Send + Sync + 'static,
     {
-        let job: JobFn = Arc::new(task);
-        {
-            let (lock, cvar) = &*self.state;
-            let mut guard = lock
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.active_job = Some(job);
-            guard.generation = guard.generation.wrapping_add(1);
-            cvar.notify_all();
-        }
-        self.completion_barrier.wait();
-        {
-            let (lock, _) = &*self.state;
-            let mut guard = lock
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.active_job = None;
+        match &self.backend {
+            PoolBackend::DedicatedThreads {
+                state,
+                shutdown,
+                spin_barrier,
+                futex_barrier,
+                coordinator_sense,
+                ..
+            } => {
+                let job: JobFn = Arc::new(task);
+                {
+                    let (lock, cvar) = &**state;
+                    let mut guard = lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    guard.active_job = Some(job);
+                    guard.generation = guard.generation.wrapping_add(1);
+                    cvar.notify_all();
+                }
+                if let Some(barrier) = spin_barrier {
+                    let mut local_sense = coordinator_sense.load(Ordering::Relaxed);
+                    barrier.wait(&mut local_sense, shutdown);
+                    coordinator_sense.store(local_sense, Ordering::Relaxed);
+                } else if let Some(barrier) = futex_barrier {
+                    barrier.wait(shutdown);
+                }
+                {
+                    let (lock, _) = &**state;
+                    let mut guard = lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    guard.active_job = None;
+                }
+            }
+            PoolBackend::Rayon { pool } => {
+                let num_workers = self.affinity.threads;
+                let wait_slots = Arc::clone(&self.wait_slots);
+                let finish_times = Arc::new(
+                    (0..num_workers)
+                        .map(|_| AtomicU64::new(0))
+                        .collect::<Vec<_>>(),
+                );
+                let t_start = Instant::now();
+
+                pool.install(|| {
+                    rayon::scope(|s| {
+                        for worker_idx in 0..num_workers {
+                            let finish_times_clone = Arc::clone(&finish_times);
+                            let task_ref = &task;
+                            s.spawn(move |_| {
+                                task_ref(worker_idx, num_workers);
+                                let elapsed_ns =
+                                    u64::try_from(t_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                                finish_times_clone[worker_idx].store(elapsed_ns, Ordering::Release);
+                            });
+                        }
+                    });
+                });
+
+                let t_total_ns =
+                    u64::try_from(t_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                for worker_idx in 0..num_workers {
+                    let finish_ns = finish_times[worker_idx].load(Ordering::Acquire);
+                    let wait_ns = t_total_ns.saturating_sub(finish_ns);
+                    wait_slots[worker_idx].record_wait_nanos(wait_ns);
+                }
+            }
         }
     }
 }
 
 impl Drop for WorkerPool {
     fn drop(&mut self) {
-        shutdown_workers(&self.state, &mut self.handles);
+        if let PoolBackend::DedicatedThreads {
+            state,
+            shutdown,
+            futex_barrier,
+            handles,
+            ..
+        } = &mut self.backend
+        {
+            shutdown_dedicated(state, shutdown, futex_barrier.as_ref(), handles);
+        }
     }
 }
 
-fn shutdown_workers(
+fn shutdown_dedicated(
     state: &Arc<(Mutex<PoolSharedState>, Condvar)>,
+    shutdown: &Arc<AtomicBool>,
+    futex_barrier: Option<&Arc<FutexBarrier>>,
     handles: &mut Vec<JoinHandle<()>>,
 ) {
+    shutdown.store(true, Ordering::Release);
     {
         let (lock, cvar) = &**state;
         let mut guard = lock
@@ -714,6 +1183,9 @@ fn shutdown_workers(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.shutdown = true;
         cvar.notify_all();
+    }
+    if let Some(fb) = futex_barrier {
+        fb.notify_shutdown();
     }
     for handle in handles.drain(..) {
         let _ = handle.join();
@@ -924,5 +1396,85 @@ mod tests {
             .verify_live_affinities()
             .expect("live affinity check succeeds");
         assert_eq!(live.len(), target_threads);
+    }
+
+    #[test]
+    fn test_worker_wait_slot_alignment_and_stride_adr006() {
+        assert_eq!(align_of::<WorkerWaitSlot>(), 64);
+        assert_eq!(size_of::<WorkerWaitSlot>(), 64);
+
+        let slots: Vec<WorkerWaitSlot> = (0..8).map(|_| WorkerWaitSlot::new()).collect();
+        for i in 0..7 {
+            let p1 = (&raw const slots[i]) as usize;
+            let p2 = (&raw const slots[i + 1]) as usize;
+            assert_eq!(p1 % 64, 0, "slot {i} must be 64-byte aligned");
+            assert_eq!(p2 - p1, 64, "stride between slots must equal 64 bytes");
+        }
+
+        // Test recording and reset
+        let slot = WorkerWaitSlot::new();
+        assert_eq!(slot.wait_nanos(), 0);
+        assert_eq!(slot.barrier_count(), 0);
+        assert!((slot.wait_ms() - 0.0).abs() < f64::EPSILON);
+
+        slot.record_wait(Duration::from_millis(5));
+        assert_eq!(slot.barrier_count(), 1);
+        assert!(slot.wait_nanos() >= 5_000_000);
+        assert!(slot.wait_ms() >= 4.9);
+
+        slot.record_wait_nanos(2_000_000);
+        assert_eq!(slot.barrier_count(), 2);
+        assert!(slot.wait_nanos() >= 7_000_000);
+
+        slot.reset();
+        assert_eq!(slot.wait_nanos(), 0);
+        assert_eq!(slot.barrier_count(), 0);
+    }
+
+    #[test]
+    fn test_spin_barrier_synchronization_and_timing() {
+        let barrier = Arc::new(SpinBarrier::new(4));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+
+        for _ in 0..4 {
+            let b = Arc::clone(&barrier);
+            let s = Arc::clone(&shutdown);
+            handles.push(thread::spawn(move || {
+                let mut local_sense = false;
+                let mut total_wait = Duration::ZERO;
+                for _ in 0..10 {
+                    total_wait += b.wait(&mut local_sense, &s);
+                }
+                total_wait
+            }));
+        }
+
+        for h in handles {
+            let _ = h.join().expect("barrier thread completes");
+        }
+    }
+
+    #[test]
+    fn test_futex_barrier_synchronization_and_timing() {
+        let barrier = Arc::new(FutexBarrier::new(4));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+
+        for _ in 0..4 {
+            let b = Arc::clone(&barrier);
+            let s = Arc::clone(&shutdown);
+            handles.push(thread::spawn(move || {
+                let mut total_wait = Duration::ZERO;
+                for _ in 0..10 {
+                    total_wait += b.wait(&s);
+                }
+                total_wait
+            }));
+        }
+
+        for h in handles {
+            let _ = h.join().expect("futex barrier thread completes");
+        }
     }
 }

@@ -13,17 +13,18 @@ pub mod weights;
 
 pub use affinity::{
     A100_CLUSTER_MASK, A100_DEFAULT_MAX_COMPUTE_THREADS, ClusterPreset, CpuTopologyInspector,
-    MockCpuTopology, ResolvedAffinity, SystemCpuTopology, VlenDomain, WorkerAffinityStatus,
-    WorkerPool, X100_CLUSTER_MASK, X100_DEFAULT_MAX_COMPUTE_THREADS, parse_cpu_list_mask,
-    resolve_affinity, resolve_affinity_with,
+    FutexBarrier, MockCpuTopology, ResolvedAffinity, SpinBarrier, SystemCpuTopology, VlenDomain,
+    WorkerAffinityStatus, WorkerPool, WorkerWaitSlot, X100_CLUSTER_MASK,
+    X100_DEFAULT_MAX_COMPUTE_THREADS, parse_cpu_list_mask, resolve_affinity, resolve_affinity_with,
 };
 pub use capability::{RecipeRegistry, verify_metadata_capabilities, verify_model_capabilities};
 pub use engine::{
-    EnginePhase, EvaluationSummary, SinglePromptEngine, StreamAction, sample_greedy_argmax,
+    EnginePhase, EvaluationSummary, PassTiming, SinglePromptEngine, StreamAction,
+    sample_greedy_argmax,
 };
 pub use k3_core::{
-    self, ArchRecipe, ExecutionContext, GgufFile, K3Error, ModelMetadata, ModelWeights, QuantType,
-    TensorDescriptor, TensorView,
+    self, ArchRecipe, CoordinationProfile, ExecutionContext, GgufFile, K3Error, ModelMetadata,
+    ModelWeights, QuantType, TensorDescriptor, TensorView,
 };
 pub use kv::SingleSlotKvArena;
 pub use memory::{

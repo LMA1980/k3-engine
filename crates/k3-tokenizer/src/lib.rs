@@ -555,6 +555,9 @@ impl GgufTokenizer {
                 if let Some(byte_id) = self.byte_tokens[usize::from(b)] {
                     out.push(byte_id);
                     cursor += 1;
+                } else if let Some(pad_id) = self.special_tokens.padding_token_id {
+                    out.push(pad_id);
+                    cursor += 1;
                 } else {
                     let ch = remaining.chars().next().unwrap_or('\0');
                     return Err(K3Error::CapabilityMismatch {
@@ -954,7 +957,7 @@ mod tests {
         assert!(tokenizer.special_tokens().add_bos_token);
         assert_eq!(tokenizer.token_to_id("hello"), Some(9));
         assert_eq!(tokenizer.id_to_token(10), Some("world"));
-        assert!(!tokenizer.merges().is_empty());
+        assert!(!tokenizer.merges().is_empty(), "merges must not be empty");
 
         // Tokenize with chat template applied and n_ctx = 64
         let prompt_tokens = tokenizer
