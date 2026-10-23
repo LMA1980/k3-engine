@@ -683,3 +683,82 @@ fn test_us04_error_split_with_single_cluster() {
     assert_eq!(out.status.code(), Some(2));
     assert!(stderr.contains("--split requires --cluster both"));
 }
+
+#[test]
+fn test_us04_error_empty_export_profile_argument() {
+    let fixture = TempModelFixture::new("err_empty_profile_path");
+    let (out, _stdout, stderr) = run_diag(&[
+        "--model",
+        fixture.path_str(),
+        "--cluster",
+        "x100",
+        "--export-profile",
+        "",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "empty argument to --export-profile must exit with code 2"
+    );
+    assert!(stderr.contains("--export-profile requires a non-empty file path"));
+}
+
+#[test]
+fn test_us04_s2_export_profile_nested_directory_creation() {
+    let fixture = TempModelFixture::new("s2_nested");
+    let unique_dir = std::env::temp_dir().join(format!("k3_nested_test_{}_{}", std::process::id(), fastrand()));
+    let export_path = unique_dir.join("sub").join("nested_profile.json");
+
+    assert!(!unique_dir.exists());
+
+    let (out, _stdout, _err) = run_diag(&[
+        "--model",
+        fixture.path_str(),
+        "--cluster",
+        "x100",
+        "--export-profile",
+        export_path.to_str().unwrap(),
+        "--max-tokens",
+        "2",
+    ]);
+
+    assert!(out.status.success());
+    assert!(export_path.exists(), "nested exported profile JSON must exist");
+
+    let file_content = std::fs::read_to_string(&export_path).expect("read nested file");
+    let profile: CostProfile = serde_json::from_str(&file_content).expect("parse nested JSON");
+    assert_eq!(profile.model_identity.architecture, "synthetic");
+
+    let _ = std::fs::remove_dir_all(&unique_dir);
+}
+
+#[test]
+fn test_us04_s2_export_profile_default_cluster() {
+    let fixture = TempModelFixture::new("s2_default_cluster");
+    let export_path = std::env::temp_dir().join(format!(
+        "k3_export_default_cluster_{}_{}.json",
+        std::process::id(),
+        fastrand()
+    ));
+
+    let (out, _stdout, _err) = run_diag(&[
+        "--model",
+        fixture.path_str(),
+        "--export-profile",
+        export_path.to_str().unwrap(),
+        "--max-tokens",
+        "2",
+    ]);
+
+    assert!(out.status.success());
+    assert!(export_path.exists());
+
+    let file_content = std::fs::read_to_string(&export_path).expect("read file");
+    let profile: CostProfile = serde_json::from_str(&file_content).expect("parse JSON");
+    assert_eq!(profile.cluster_placement.cluster, "x100");
+    assert_eq!(profile.split_strategy, "none");
+    assert!(profile.allocated_cores.total >= 1);
+
+    let _ = std::fs::remove_file(&export_path);
+}
+

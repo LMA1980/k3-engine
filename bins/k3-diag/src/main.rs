@@ -264,10 +264,13 @@ impl DiagConfig {
                     config.json = true;
                 }
                 "--export-profile" => {
-                    config.export_profile = Some(
-                        args.next()
-                            .ok_or_else(|| "--export-profile requires a file path".to_owned())?,
-                    );
+                    let path = args
+                        .next()
+                        .ok_or_else(|| "--export-profile requires a file path".to_owned())?;
+                    if path.trim().is_empty() {
+                        return Err("--export-profile requires a non-empty file path".to_owned());
+                    }
+                    config.export_profile = Some(path);
                 }
                 "--summary" | "--bench" => {
                     config.summary = true;

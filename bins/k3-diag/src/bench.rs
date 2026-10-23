@@ -793,6 +793,11 @@ pub(crate) fn run_matrix_benchmark<W: Write>(
     if let Some(export_path) = &config.export_profile {
         let json_str = serde_json::to_string_pretty(&cost_profile)
             .map_err(|e| cap_err("json", format!("failed to serialize cost profile: {e}")))?;
+        if let Some(parent) = std::path::Path::new(export_path).parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
         std::fs::write(export_path, json_str)
             .map_err(|e| cap_err("io", format!("failed to write cost profile to '{export_path}': {e}")))?;
     }
