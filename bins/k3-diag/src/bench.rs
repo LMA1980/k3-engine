@@ -557,10 +557,11 @@ pub(crate) fn run_matrix_benchmark<W: Write>(
     } else {
         prefill_ms / prompt_tokens.len() as f64
     };
-    let decode_cost_per_token_ms = if tokens0.is_empty() {
-        0.0
+    let mean_decode_steps = mean(primary.summaries.iter().map(|s| s.timing.decode_steps as f64));
+    let decode_cost_per_token_ms = if mean_decode_steps > 0.0 {
+        decode_ms / mean_decode_steps
     } else {
-        decode_ms / tokens0.len() as f64
+        0.0
     };
     let prefill = PhaseReport {
         latency_ms: prefill_ms,
