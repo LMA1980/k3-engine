@@ -355,7 +355,13 @@ fn test_us04_s2_json_contains_valid_cost_profile_schema() {
     // Mathematical consistency: latency per token should closely match 1000 / throughput
     let expected_decode_cost = 1000.0 / cp.decode_tokens_per_sec;
     let ratio = cp.decode_cost_per_token_ms / expected_decode_cost;
-    assert!((ratio - 1.0).abs() < 0.05, "decode cost must align with decode rate");
+    assert!(
+        (ratio - 1.0).abs() < 0.05,
+        "decode cost ({}) must align with expected ({}) ratio={}",
+        cp.decode_cost_per_token_ms,
+        expected_decode_cost,
+        ratio
+    );
 
     // 5. Memory footprint consistency
     assert!(cp.weight_bytes > 0);
