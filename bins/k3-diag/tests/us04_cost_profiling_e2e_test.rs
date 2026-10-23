@@ -330,15 +330,16 @@ fn test_us04_s2_json_contains_valid_cost_profile_schema() {
     assert_eq!(cp.quantization_level.tensor_bytes.get("F32"), Some(&64));
 
     // 3. Cluster placement & core allocation
+    // Per ADR-007, x100 defaults to 6 compute threads on cores 0..5 (0x003F), reserving 2 cores for OS duties
     assert_eq!(cp.cluster_placement.cluster, "x100");
-    assert_eq!(cp.cluster_placement.effective_core_mask, "0x00FF");
-    assert_eq!(cp.cluster_placement.allocated_cores, 8);
-    assert_eq!(cp.cluster_placement.x100_cores, 8);
+    assert_eq!(cp.cluster_placement.effective_core_mask, "0x003F");
+    assert_eq!(cp.cluster_placement.allocated_cores, 6);
+    assert_eq!(cp.cluster_placement.x100_cores, 6);
     assert_eq!(cp.cluster_placement.a100_cores, 0);
     assert_eq!(cp.split_strategy, "none");
-    assert_eq!(cp.allocated_cores.total, 8);
-    assert_eq!(cp.allocated_cores.total_cores, 8);
-    assert_eq!(cp.allocated_cores.x100_cores, 8);
+    assert_eq!(cp.allocated_cores.total, 6);
+    assert_eq!(cp.allocated_cores.total_cores, 6);
+    assert_eq!(cp.allocated_cores.x100_cores, 6);
     assert_eq!(cp.allocated_cores.a100_cores, 0);
 
     // 4. Execution cost baseline
@@ -499,12 +500,12 @@ fn test_us04_s2_quantization_detection_f32_uniform() {
 }
 
 #[test]
-fn test_us04_s2_quantization_detection_q8_0() {
+fn test_us04_s2_quantization_detection_f16() {
     let specs = [
-        ("blk.0.weight", QuantType::Q8_0, &[64][..]),
-        ("output_norm.weight", QuantType::F32, &[16][..]),
+        ("blk.0.weight", QuantType::F16, &[32][..]),
+        ("output_norm.weight", QuantType::F32, &[8][..]),
     ];
-    let fixture = TempModelFixture::with_specs("s2_q8", &specs);
+    let fixture = TempModelFixture::with_specs("s2_f16", &specs);
     let (out, val, _err) = run_diag_json(&[
         "--model",
         fixture.path_str(),
@@ -516,9 +517,12 @@ fn test_us04_s2_quantization_detection_q8_0() {
     assert!(out.status.success());
 
     let cp: CostProfile = serde_json::from_value(val["cost_profile"].clone()).unwrap();
-    // Q8_0 has 68 bytes, F32 has 64 bytes -> Q8_0 is primary
-    assert_eq!(cp.quantization_level.primary, "Q8_0");
-    assert_eq!(cp.quantization_level.summary.get("Q8_0"), Some(&1));
+    // F16 has 64 bytes (32 * 2), F32 has 32 bytes (8 * 4) -> F16 is primary
+    assert_eq!(cp.quantization_level.primary, "F16");
+    assert_eq!(cp.quantization_level.summary.get("F16"), Some(&1));
+    assert_eq!(cp.quantization_level.summary.get("F32"), Some(&1));
+    assert_eq!(cp.quantization_level.tensor_bytes.get("F16"), Some(&64));
+    assert_eq!(cp.quantization_level.tensor_bytes.get("F32"), Some(&32));
 }
 
 #[test]
@@ -555,7 +559,7 @@ fn test_us04_s2_memory_footprint_invariants() {
 fn test_us04_s2_allocated_cores_breakdown() {
     let fixture = TempModelFixture::new("s2_cores");
 
-    // X100: 8 X100 cores, 0 A100 cores
+    // X100: defaults to 6 X100 cores, 0 A100 cores (ADR-007)
     let (out_x, val_x, _) = run_diag_json(&[
         "--model",
         fixture.path_str(),
@@ -566,9 +570,9 @@ fn test_us04_s2_allocated_cores_breakdown() {
     ]);
     assert!(out_x.status.success());
     let cp_x: CostProfile = serde_json::from_value(val_x["cost_profile"].clone()).unwrap();
-    assert_eq!(cp_x.allocated_cores.x100_cores, 8);
+    assert_eq!(cp_x.allocated_cores.x100_cores, 6);
     assert_eq!(cp_x.allocated_cores.a100_cores, 0);
-    assert_eq!(cp_x.allocated_cores.total, 8);
+    assert_eq!(cp_x.allocated_cores.total, 6);
 
     // A100: 0 X100 cores, 8 A100 cores
     let (out_a, val_a, _) = run_diag_json(&[
@@ -585,7 +589,7 @@ fn test_us04_s2_allocated_cores_breakdown() {
     assert_eq!(cp_a.allocated_cores.a100_cores, 8);
     assert_eq!(cp_a.allocated_cores.total, 8);
 
-    // Both: 8 X100 cores, 8 A100 cores
+    // Both (phase split): 6 X100 cores, 8 A100 cores = 14 total cores (ADR-007)
     let (out_b, val_b, _) = run_diag_json(&[
         "--model",
         fixture.path_str(),
@@ -598,9 +602,9 @@ fn test_us04_s2_allocated_cores_breakdown() {
     ]);
     assert!(out_b.status.success());
     let cp_b: CostProfile = serde_json::from_value(val_b["cost_profile"].clone()).unwrap();
-    assert_eq!(cp_b.allocated_cores.x100_cores, 8);
+    assert_eq!(cp_b.allocated_cores.x100_cores, 6);
     assert_eq!(cp_b.allocated_cores.a100_cores, 8);
-    assert_eq!(cp_b.allocated_cores.total, 16);
+    assert_eq!(cp_b.allocated_cores.total, 14);
 }
 
 // ============================================================================
