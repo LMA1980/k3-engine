@@ -229,6 +229,7 @@ fn test_us04_s1_human_readable_table_format() {
         "3",
     ]);
     assert!(out.status.success());
+    println!("\n=== Single-Cluster X100 Summary Table ===\n{stdout}");
     assert!(stdout.contains("Prefill"), "must contain Prefill row");
     assert!(stdout.contains("Decode"), "must contain Decode row");
     assert!(stdout.contains("ms/token"), "must display cost in ms/token");
@@ -249,6 +250,7 @@ fn test_us04_s1_human_readable_table_format() {
         "3",
     ]);
     assert!(out2.status.success());
+    println!("\n=== Dual-Cluster (Phase Split) Summary Table ===\n{stdout2}");
     assert!(stdout2.contains("Split Policy         : phase"));
     assert!(stdout2.contains("Cost Profile Baseline (US-04):"));
 }
