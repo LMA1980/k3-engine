@@ -19,7 +19,7 @@ use std::time::Duration;
 use k3_worker::affinity::{parse_affinity_spec, pin_worker_core, verify_cluster_capabilities};
 use k3_worker::cli::WorkerConfig;
 use k3_worker::error::{
-    EXIT_CAPABILITY_MISMATCH, EXIT_INVALID_ARGS, EXIT_PROTOCOL_ERROR,
+    EXIT_INVALID_ARGS, EXIT_PROTOCOL_ERROR,
 };
 use k3_worker::weights::LockedWeights;
 use k3_worker::worker::WorkerEngine;
@@ -50,7 +50,7 @@ async fn main() -> ExitCode {
     // 1. Validate cluster and hardware capabilities
     if let Err(e) = verify_cluster_capabilities(&config.cluster, config.affinity.as_deref()) {
         eprintln!("[k3-worker error] capability verification failed: {e}");
-        return ExitCode::from(EXIT_CAPABILITY_MISMATCH as u8);
+        return ExitCode::from(e.exit_code() as u8);
     }
 
     // 2. Open and lock model weights read-only
@@ -186,11 +186,11 @@ async fn main() -> ExitCode {
     tokio::select! {
         _ = sigint.recv() => {
             eprintln!("[k3-worker] received SIGINT (Ctrl+C), clean exit");
-            ExitCode::SUCCESS
+            std::process::exit(0);
         }
         _ = sigterm.recv() => {
             eprintln!("[k3-worker] received SIGTERM, clean exit");
-            ExitCode::SUCCESS
+            std::process::exit(0);
         }
         res = worker_task => {
             match res {

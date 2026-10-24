@@ -6,7 +6,10 @@
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 const BIN_PATH: &str = env!("CARGO_BIN_EXE_k3-worker");
 
@@ -165,3 +168,112 @@ fn test_capability_mismatch_exit_10() {
     drop(lock_file);
     let _ = std::fs::remove_file(&model_path);
 }
+
+#[test]
+fn test_cli_invalid_affinity_out_of_bounds_exit_2() {
+    let model_path = std::env::temp_dir().join("k3_worker_aff64_model.gguf");
+    {
+        let mut f = File::create(&model_path).unwrap();
+        f.write_all(b"VALID_GGUF_HEADER").unwrap();
+    }
+
+    let output = Command::new(BIN_PATH)
+        .args([
+            "--model",
+            model_path.to_str().unwrap(),
+            "--socket",
+            "/tmp/fake.sock",
+            "--affinity",
+            "64",
+        ])
+        .output()
+        .expect("run k3-worker --affinity 64");
+
+    let _ = std::fs::remove_file(&model_path);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "Invalid core index 64 must return exit code 2 (InvalidArguments)"
+    );
+}
+
+#[test]
+fn test_signal_termination_sigint_and_sigterm_exit_0() {
+    let model_path = std::env::temp_dir().join("k3_worker_sig_test_model.gguf");
+    {
+        let mut f = File::create(&model_path).unwrap();
+        f.write_all(b"VALID_GGUF_HEADER").unwrap();
+    }
+
+    for &sig in &[libc::SIGINT, libc::SIGTERM] {
+        let sig_name = if sig == libc::SIGINT { "SIGINT" } else { "SIGTERM" };
+        let sock_path = std::env::temp_dir().join(format!("k3_worker_sig_{sig_name}.sock"));
+        if sock_path.exists() {
+            let _ = std::fs::remove_file(&sock_path);
+        }
+
+        let mut child = Command::new(BIN_PATH)
+            .args([
+                "--model",
+                model_path.to_str().unwrap(),
+                "--socket",
+                sock_path.to_str().unwrap(),
+                "--listen",
+                "--cluster",
+                "x100",
+            ])
+            .spawn()
+            .expect("spawn worker");
+
+        // Wait for socket to become available and connect to unblock listener.accept()
+        let mut connected = None;
+        let connect_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < connect_deadline {
+            if sock_path.exists() {
+                if let Ok(stream) = UnixStream::connect(&sock_path) {
+                    connected = Some(stream);
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _stream = connected.expect("failed to connect to worker socket");
+
+        // Short sleep to allow worker to register signal handlers and enter select!
+        thread::sleep(Duration::from_millis(50));
+
+        // Deliver OS signal
+        unsafe {
+            libc::kill(child.id() as i32, sig);
+        }
+
+        // Wait for exit, asserting it exits with code 0 within 2 seconds
+        let wait_start = Instant::now();
+        let mut exited = false;
+        while wait_start.elapsed() < Duration::from_secs(2) {
+            if let Ok(Some(_)) = child.try_wait() {
+                exited = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        if !exited {
+            let _ = child.kill();
+        }
+        let status = child.wait().expect("wait for child");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "{sig_name} must exit cleanly with code 0"
+        );
+        assert!(exited, "{sig_name} termination timed out (> 2 seconds), deadlock detected");
+
+        if sock_path.exists() {
+            let _ = std::fs::remove_file(&sock_path);
+        }
+    }
+
+    let _ = std::fs::remove_file(&model_path);
+}
+
