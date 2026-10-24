@@ -54,7 +54,7 @@ pub fn next_seq() -> u64 {
 }
 
 /// Fixed 128-byte header aligned to cacheline boundaries at offset 0 of shared memory arena.
-#[repr(C)]
+#[repr(C, align(64))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArenaHeader {
     pub magic: [u8; 4],
@@ -66,17 +66,14 @@ pub struct ArenaHeader {
     pub n_ctx: u32,
     pub block_size: u32,
     pub num_blocks: u32,
-    pub meta_table_offset: u64,
-    pub meta_table_bytes: u64,
-    pub token_slots_offset: u64,
-    pub token_slots_bytes: u64,
-    pub kv_blocks_offset: u64,
-    pub kv_blocks_bytes: u64,
-    pub output_slabs_offset: u64,
-    pub output_slabs_bytes: u64,
     pub active_slots: u32,
+    pub _reserved0: u32,
+    pub meta_table_offset: u64,
+    pub token_slots_offset: u64,
+    pub kv_blocks_offset: u64,
+    pub output_slabs_offset: u64,
     pub generation_counter: u64,
-    pub reserved: [u8; 28],
+    pub reserved: [u8; 40],
 }
 
 impl Default for ArenaHeader {
@@ -91,32 +88,26 @@ impl Default for ArenaHeader {
             n_ctx: 64,
             block_size: BLOCK_SIZE_TOKENS,
             num_blocks: 4,
-            meta_table_offset: 128,
-            meta_table_bytes: 4 * 64,
-            token_slots_offset: 128 + 4 * 64,
-            token_slots_bytes: 64 * 4 + 16,
-            kv_blocks_offset: 1024,
-            kv_blocks_bytes: 4 * 16 * 2 * 2 * 64 * 4,
-            output_slabs_offset: 4096,
-            output_slabs_bytes: 32000 * 4 + 64,
             active_slots: 1,
+            _reserved0: 0,
+            meta_table_offset: 128,
+            token_slots_offset: 128 + 4 * 64,
+            kv_blocks_offset: 1024,
+            output_slabs_offset: 4096,
             generation_counter: 0,
-            reserved: [0; 28],
+            reserved: [0; 40],
         }
     }
 }
 
 /// 64-byte aligned metadata entry for a 16-token KV cache block.
-#[repr(C)]
+#[repr(C, align(64))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KvBlockMeta {
     pub block_id: u32,
     pub tag: u32,
-    pub project_id: u64,
     pub refcount: u32,
     pub committed_tokens: u32,
-    pub session_id_hash: u64,
-    pub last_access_timestamp: u64,
     pub sampler_rng_state: [u64; 4],
     pub padding: [u8; 16],
 }
@@ -126,11 +117,8 @@ impl Default for KvBlockMeta {
         Self {
             block_id: 0,
             tag: TAG_VOLATILE,
-            project_id: 1,
             refcount: 1,
             committed_tokens: 0,
-            session_id_hash: 0,
-            last_access_timestamp: 0,
             sampler_rng_state: [42, 0, 0, 0],
             padding: [0; 16],
         }
@@ -437,7 +425,14 @@ impl SocketIpcHelper {
         if ret != 0 {
             return Err(io::Error::last_os_error());
         }
+        let buf_size = 131_072_i32;
         unsafe {
+            let buf_ptr = &buf_size as *const _ as *const libc::c_void;
+            let buf_len = std::mem::size_of_val(&buf_size) as libc::socklen_t;
+            libc::setsockopt(fds[0], libc::SOL_SOCKET, libc::SO_SNDBUF, buf_ptr, buf_len);
+            libc::setsockopt(fds[0], libc::SOL_SOCKET, libc::SO_RCVBUF, buf_ptr, buf_len);
+            libc::setsockopt(fds[1], libc::SOL_SOCKET, libc::SO_SNDBUF, buf_ptr, buf_len);
+            libc::setsockopt(fds[1], libc::SOL_SOCKET, libc::SO_RCVBUF, buf_ptr, buf_len);
             Ok((OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])))
         }
     }
@@ -515,6 +510,22 @@ impl SocketIpcHelper {
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Socket closed by peer"));
             }
             return Err(io::Error::last_os_error());
+        }
+
+        let mut total_hdr = bytes_read as usize;
+        while total_hdr < 4 {
+            let n = unsafe {
+                libc::recv(
+                    sock,
+                    len_buf.as_mut_ptr().add(total_hdr) as *mut libc::c_void,
+                    4 - total_hdr,
+                    0,
+                )
+            };
+            if n <= 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Truncated length prefix"));
+            }
+            total_hdr += n as usize;
         }
 
         let mut received_fd: Option<OwnedFd> = None;

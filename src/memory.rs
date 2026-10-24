@@ -201,40 +201,36 @@ impl MemoryInspector for SystemMemoryInspector {
             }
         }
 
-        let file = fs::File::open("/proc/meminfo").map_err(|_err| {
-            K3Error::InsufficientLockableMemory {
-                required_bytes: 0,
-                weight_bytes: 0,
-                kv_bytes: 0,
-                available_bytes: 0,
-                rlimit_memlock_bytes: 0,
-            }
-        })?;
-
-        let reader = BufReader::new(file);
-        for line in reader.lines() {
-            let Ok(entry) = line else { continue };
-            if let Some(rest) = entry.strip_prefix("MemAvailable:") {
-                let parts: Vec<&str> = rest.split_whitespace().collect();
-                if let Some(kb_str) = parts.first() {
-                    if let Ok(kb) = kb_str.parse::<u64>() {
-                        return kb
-                            .checked_mul(1024)
-                            .ok_or(K3Error::InsufficientLockableMemory {
-                                required_bytes: 0,
-                                weight_bytes: 0,
-                                kv_bytes: 0,
-                                available_bytes: 0,
-                                rlimit_memlock_bytes: 0,
-                            });
+        if let Ok(file) = fs::File::open("/proc/meminfo") {
+            let reader = BufReader::new(file);
+            for line in reader.lines() {
+                let Ok(entry) = line else { continue };
+                if let Some(rest) = entry.strip_prefix("MemAvailable:") {
+                    let parts: Vec<&str> = rest.split_whitespace().collect();
+                    if let Some(kb_str) = parts.first() {
+                        if let Ok(kb) = kb_str.parse::<u64>() {
+                            return kb
+                                .checked_mul(1024)
+                                .ok_or(K3Error::InsufficientLockableMemory {
+                                    required_bytes: 0,
+                                    weight_bytes: 0,
+                                    kv_bytes: 0,
+                                    available_bytes: 0,
+                                    rlimit_memlock_bytes: 0,
+                                });
+                        }
                     }
                 }
             }
         }
 
         // Fallback: query sysconf if /proc/meminfo parsing did not find MemAvailable
-        // SAFETY: sysconf(_SC_AVPHYS_PAGES) is a POSIX query with no side effects.
+        // SAFETY: sysconf is a POSIX query with no side effects.
+        #[cfg(target_os = "linux")]
         let pages = unsafe { libc::sysconf(libc::_SC_AVPHYS_PAGES) };
+        // SAFETY: sysconf is a POSIX query with no side effects.
+        #[cfg(not(target_os = "linux"))]
+        let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
         // SAFETY: sysconf(_SC_PAGESIZE) is a POSIX query with no side effects.
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if pages > 0 && page_size > 0 {

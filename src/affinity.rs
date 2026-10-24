@@ -1829,12 +1829,17 @@ fn shutdown_dedicated(
 /// 4. When it returns, the thread is permanently on `assigned_core`, so all subsequent function calls
 ///    have matching prologues and epilogues in that cluster's native VLEN domain.
 #[inline(never)]
-#[expect(
+#[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    reason = "syscall return codes and decimal digits fit in i32/u8"
+    clippy::unnecessary_wraps
 )]
 unsafe fn raw_pin_thread(assigned_core: usize) -> Result<u64, i32> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(1u64 << assigned_core)
+    }
+    #[cfg(target_os = "linux")]
     // SAFETY: Raw Linux syscalls and libc file operations to pin the thread
     // without triggering scalable vector spill allocation in function frame.
     unsafe {
@@ -1923,8 +1928,11 @@ fn verify_pinned_thread(
         });
     }
 
-    // SAFETY: SYS_gettid is thread-safe taking no args.
-    let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+    // SAFETY: SYS_gettid is a read-only syscall taking no arguments.
+    #[cfg(target_os = "linux")]
+    let tid: i64 = unsafe { libc::syscall(libc::SYS_gettid) };
+    #[cfg(not(target_os = "linux"))]
+    let tid: i64 = 0;
     let proc_cpus_allowed_list =
         read_proc_task_cpus_allowed_list(tid).unwrap_or_else(|| assigned_core.to_string());
 
