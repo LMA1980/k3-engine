@@ -16,13 +16,13 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use k3_worker::affinity::{parse_affinity_spec, pin_worker_core, verify_cluster_capabilities};
-use k3_worker::cli::WorkerConfig;
-use k3_worker::error::{
+use k3_engine::worker::affinity::{parse_affinity_spec, pin_worker_core, verify_cluster_capabilities};
+use k3_engine::worker::cli::WorkerConfig;
+use k3_engine::worker::error::{
     EXIT_INVALID_ARGS, EXIT_PROTOCOL_ERROR,
 };
-use k3_worker::weights::LockedWeights;
-use k3_worker::worker::WorkerEngine;
+use k3_engine::worker::weights::LockedWeights;
+use k3_engine::worker::worker::WorkerEngine;
 
 #[allow(clippy::too_many_lines)]
 #[tokio::main]

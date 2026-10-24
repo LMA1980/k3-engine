@@ -12,6 +12,8 @@ pub mod forward;
 pub mod kv;
 pub mod memory;
 pub mod weights;
+pub mod worker;
+pub use worker as k3_worker;
 
 pub use affinity::{
     A100_CLUSTER_MASK, A100_DEFAULT_MAX_COMPUTE_THREADS, ClusterPreset, CpuTopologyInspector,

@@ -221,15 +221,24 @@ fn requant(v: i32, shift: u32) -> i8 {
 }
 
 fn cpu_bit() -> u64 {
-    // SAFETY: `sched_getcpu` has no preconditions.
     #[cfg(target_os = "linux")]
-    let cpu = unsafe { libc::sched_getcpu() };
+    {
+        // SAFETY: `sched_getcpu` has no preconditions.
+        let cpu = unsafe { libc::sched_getcpu() };
+        u64::try_from(cpu)
+            .ok()
+            .filter(|&c| c < 64)
+            .map_or(0, |c| 1_u64 << c)
+    }
     #[cfg(not(target_os = "linux"))]
-    let cpu = 0;
-    u64::try_from(cpu)
-        .ok()
-        .filter(|&c| c < 64)
-        .map_or(0, |c| 1_u64 << c)
+    {
+        if let Some(core) = crate::affinity::get_current_thread_core() {
+            if core < 64 {
+                return 1_u64 << core;
+            }
+        }
+        0
+    }
 }
 
 /// One weight matrix stored row-major (`n x k`, vector path) and IME-packed (IME path).
@@ -965,8 +974,9 @@ pub fn measure_memory_bandwidth(pool: &WorkerPool, lane: Lane) -> Result<f64, K3
 pub fn probe_ime_on_core(core: usize) -> bool {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = core;
-        false
+        // On non-Linux platforms, follow canonical SpacemiT K3 topology: Cluster 1 (A100, cores 8-15)
+        // supports IME matrix acceleration, while Cluster 0 (X100, cores 0-7) does not.
+        (8..16).contains(&core)
     }
     #[cfg(target_os = "linux")]
     {

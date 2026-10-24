@@ -7,7 +7,7 @@ use std::ptr::NonNull;
 
 use k3_core::ipc::shm::DEFAULT_LIMIT_MEMLOCK_BYTES;
 
-use crate::error::WorkerError;
+use super::error::WorkerError;
 
 /// Holds a read-only memory-mapped and locked GGUF model file.
 #[derive(Debug)]

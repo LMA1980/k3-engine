@@ -1,25 +1,47 @@
 [package]
 name = "k3-engine"
 description = "Low-level compute runtime for the SpacemiT K3 AI platform"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "AGPL-3.0-only"
 repository = "https://github.com/LMA1980/k3-engine"
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+
+[[bin]]
+name = "k3-diag"
+path = "src/bin/k3-diag/main.rs"
+
+[[bin]]
+name = "k3-worker"
+path = "src/bin/k3-worker/main.rs"
 
 [dependencies]
 arch-synthetic = { workspace = true, optional = true }
+arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
+fory = { workspace = true }
+fory-derive = { workspace = true }
 k3-core = { workspace = true }
+k3-tokenizer = { workspace = true }
 kernels-rvv = { workspace = true, optional = true }
 libc = { workspace = true }
 rayon = { workspace = true }
+sendfd = { workspace = true }
 serde = { workspace = true }
-
-[dev-dependencies]
-k3-tokenizer = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "macros", "signal", "time"] }
+zerocopy = { workspace = true }
 
 [features]
 default = ["arch-synthetic", "kernels-rvv"]

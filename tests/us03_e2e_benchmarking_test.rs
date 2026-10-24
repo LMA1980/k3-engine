@@ -261,7 +261,9 @@ impl Drop for CorruptModelFixture {
 
 /// Returns a [`Command`] pointing to the compiled `k3-diag` binary.
 fn k3_diag_cmd() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_k3-diag"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_k3-diag"));
+    cmd.env("K3_CPU_ONLINE_MASK", "0xFFFF");
+    cmd
 }
 
 /// Executes `k3-diag` with given arguments and captures status, stdout, and stderr.

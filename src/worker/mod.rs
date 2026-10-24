@@ -11,7 +11,8 @@
     clippy::cast_sign_loss,
     clippy::too_many_lines,
     clippy::missing_errors_doc,
-    clippy::missing_panics_doc
+    clippy::missing_panics_doc,
+    clippy::module_inception
 )]
 
 pub mod affinity;

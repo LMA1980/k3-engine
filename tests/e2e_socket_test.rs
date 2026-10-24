@@ -22,9 +22,9 @@ use k3_core::ipc::protocol::{
     ShutdownCommand,
 };
 use k3_core::ipc::shm::SharedMemoryArena;
-use k3_worker::cli::WorkerConfig;
-use k3_worker::weights::LockedWeights;
-use k3_worker::worker::WorkerEngine;
+use k3_engine::worker::cli::WorkerConfig;
+use k3_engine::worker::weights::LockedWeights;
+use k3_engine::worker::worker::WorkerEngine;
 use zerocopy::{FromBytes, IntoBytes};
 
 #[test]
