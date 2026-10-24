@@ -4,6 +4,7 @@
 //! (`x100` or `a100`), core bitmask, and worker concurrency bound while preventing cross-cluster
 //! VLEN migration (ADR-007, ADR-008, `core-affinity.md`, US-01 Scenario 2).
 
+use std::cell::Cell;
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -12,6 +13,20 @@ use std::time::{Duration, Instant};
 
 use k3_core::{CoordinationProfile, K3Error};
 use serde::{Deserialize, Serialize};
+
+thread_local! {
+    static CURRENT_ASSIGNED_CORE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+#[allow(dead_code)]
+pub(crate) fn set_current_thread_core(core: usize) {
+    CURRENT_ASSIGNED_CORE.with(|c| c.set(Some(core)));
+}
+
+#[allow(dead_code)]
+pub(crate) fn get_current_thread_core() -> Option<usize> {
+    CURRENT_ASSIGNED_CORE.with(Cell::get)
+}
 
 /// Core bitmask for Cluster 0 (`X100` `OoO` cores 0–7, `zvl256b`).
 pub const X100_CLUSTER_MASK: u64 = 0x00FF;
@@ -1213,6 +1228,7 @@ impl WorkerPool {
                     let handle = thread::Builder::new()
                         .name(format!("k3-worker-{worker_index}"))
                         .spawn(move || {
+                            set_current_thread_core(assigned_core);
                             // SAFETY: `raw_pin_thread` uses only fixed-frame integer syscalls to pin the worker.
                             let pin_res = unsafe { raw_pin_thread(assigned_core) };
                             let pin_result = verify_pinned_thread(
@@ -1348,6 +1364,7 @@ impl WorkerPool {
                     .thread_name(|i| format!("k3-rayon-worker-{i}"))
                     .start_handler(move |worker_idx| {
                         let assigned_core = assigned_cores[worker_idx];
+                        set_current_thread_core(assigned_core);
                         // SAFETY: `raw_pin_thread` uses only fixed-frame integer syscalls to pin the worker.
                         let pin_res = unsafe { raw_pin_thread(assigned_core) };
                         let res = verify_pinned_thread(
