@@ -1,0 +1,33 @@
+[package]
+name = "k3-worker"
+description = "Isolated compute worker binary executing zero-copy forward passes for K3 model-runner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository = "https://github.com/LMA1980/k3-engine"
+
+[lints]
+workspace = true
+
+[lib]
+name = "k3_worker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "k3-worker"
+path = "src/main.rs"
+
+[dependencies]
+k3-core = { workspace = true }
+libc = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "macros", "signal", "time"] }
+fory = { workspace = true }
+fory-derive = { workspace = true }
+zerocopy = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-array = { workspace = true }
+sendfd = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+k3-engine = { workspace = true }
