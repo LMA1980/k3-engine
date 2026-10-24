@@ -35,14 +35,18 @@ unsafe impl Send for LockedModelWeights {}
 unsafe impl Sync for LockedModelWeights {}
 
 fn map_and_lock_file(fd: std::os::fd::RawFd, file_len: usize) -> Result<*mut u8, K3Error> {
-    // 3. Map file read-only via mmap(PROT_READ, MAP_PRIVATE | MAP_POPULATE)
+    #[cfg(target_os = "linux")]
+    let map_flags = libc::MAP_PRIVATE | libc::MAP_POPULATE;
+    #[cfg(not(target_os = "linux"))]
+    let map_flags = libc::MAP_PRIVATE;
+
     // SAFETY: mmap is called with valid arguments: length > 0, valid fd, PROT_READ, MAP_PRIVATE.
     let ptr = unsafe {
         libc::mmap(
             ptr::null_mut(),
             file_len,
             libc::PROT_READ,
-            libc::MAP_PRIVATE | libc::MAP_POPULATE,
+            map_flags,
             fd,
             0,
         )
@@ -60,6 +64,7 @@ fn map_and_lock_file(fd: std::os::fd::RawFd, file_len: usize) -> Result<*mut u8,
 
     // 4. Best-effort huge page hint (ADR-037)
     // SAFETY: madvise is called on valid mapped range [ptr .. ptr + file_len].
+    #[cfg(target_os = "linux")]
     unsafe {
         libc::madvise(ptr, file_len, libc::MADV_HUGEPAGE);
     }
@@ -324,6 +329,7 @@ impl LockedModelWeights {
 
         // 4. Best-effort huge page hint and mandatory mlock() (ADR-037)
         // SAFETY: raw_void_ptr is a valid mapped memory region of length file_len.
+        #[cfg(target_os = "linux")]
         unsafe {
             libc::madvise(raw_void_ptr, file_len, libc::MADV_HUGEPAGE);
         }

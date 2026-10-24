@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use k3_core::K3Error;
+#[allow(unused_imports)]
 use kernels_rvv::ime::{
     TILE_C, TILE_K, TILE_M, TILE_N, dot_i8_vector, gemm_i8_ime, gemm_i8_vector, ime_probe_exec,
     ime_vmadot_count, pack_tiles, tile_count, vector_dot_count,
@@ -221,7 +222,10 @@ fn requant(v: i32, shift: u32) -> i8 {
 
 fn cpu_bit() -> u64 {
     // SAFETY: `sched_getcpu` has no preconditions.
+    #[cfg(target_os = "linux")]
     let cpu = unsafe { libc::sched_getcpu() };
+    #[cfg(not(target_os = "linux"))]
+    let cpu = 0;
     u64::try_from(cpu)
         .ok()
         .filter(|&c| c < 64)
@@ -959,15 +963,22 @@ pub fn measure_memory_bandwidth(pool: &WorkerPool, lane: Lane) -> Result<f64, K3
 #[must_use]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn probe_ime_on_core(core: usize) -> bool {
-    let mask = 1_u64 << core;
-    // SAFETY: the child only issues async-signal-safe operations (registering with
-    // `/proc/set_ai_thread` for A100 cores >= 8, a raw affinity syscall, the stack-only probe
-    // and `_exit`); the parent merely reaps it.
-    unsafe {
-        let pid = libc::fork();
-        if pid < 0 {
-            return false;
-        }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = core;
+        false
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mask = 1_u64 << core;
+        // SAFETY: the child only issues async-signal-safe operations (registering with
+        // `/proc/set_ai_thread` for A100 cores >= 8, a raw affinity syscall, the stack-only probe
+        // and `_exit`); the parent merely reaps it.
+        unsafe {
+            let pid = libc::fork();
+            if pid < 0 {
+                return false;
+            }
         if pid == 0 {
             if core >= 8 {
                 let tid = libc::syscall(libc::SYS_gettid);
@@ -1012,5 +1023,6 @@ pub fn probe_ime_on_core(core: usize) -> bool {
             return false;
         }
         libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+    }
     }
 }

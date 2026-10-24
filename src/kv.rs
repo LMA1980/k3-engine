@@ -185,6 +185,7 @@ impl SingleSlotKvArena {
 
         // 2. Best-effort huge page hint (ADR-037)
         // SAFETY: madvise is called on the valid anonymous memory mapping.
+        #[cfg(target_os = "linux")]
         unsafe {
             libc::madvise(raw_ptr, layout.aligned_bytes, libc::MADV_HUGEPAGE);
         }

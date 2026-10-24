@@ -66,12 +66,12 @@ impl WorkerConfig {
                     println!("k3-worker {}", env!("CARGO_PKG_VERSION"));
                     return Ok(None);
                 }
-                "--socket" => {
+                "--socket" | "--socket-path" => {
                     let path = args
                         .next()
-                        .ok_or_else(|| WorkerError::InvalidArguments("--socket requires a path".to_owned()))?;
+                        .ok_or_else(|| WorkerError::InvalidArguments(format!("{arg} requires a path")))?;
                     if path.trim().is_empty() {
-                        return Err(WorkerError::InvalidArguments("--socket path cannot be empty".to_owned()));
+                        return Err(WorkerError::InvalidArguments(format!("{arg} path cannot be empty")));
                     }
                     config.socket_path = Some(PathBuf::from(path));
                 }
@@ -87,14 +87,29 @@ impl WorkerConfig {
                     }
                     config.socket_fd = Some(fd);
                 }
-                "--model" => {
+                "--model" | "--weights-path" => {
                     let path = args
                         .next()
-                        .ok_or_else(|| WorkerError::InvalidArguments("--model requires a path".to_owned()))?;
+                        .ok_or_else(|| WorkerError::InvalidArguments(format!("{arg} requires a path")))?;
                     if path.trim().is_empty() {
-                        return Err(WorkerError::InvalidArguments("--model path cannot be empty".to_owned()));
+                        return Err(WorkerError::InvalidArguments(format!("{arg} path cannot be empty")));
                     }
                     config.model_path = PathBuf::from(path);
+                }
+                "--model-id" => {
+                    let _ = args
+                        .next()
+                        .ok_or_else(|| WorkerError::InvalidArguments("--model-id requires an identifier".to_owned()))?;
+                }
+                "--threads" => {
+                    let _ = args
+                        .next()
+                        .ok_or_else(|| WorkerError::InvalidArguments("--threads requires an integer count".to_owned()))?;
+                }
+                "--memlock-limit" => {
+                    let _ = args
+                        .next()
+                        .ok_or_else(|| WorkerError::InvalidArguments("--memlock-limit requires a byte ceiling".to_owned()))?;
                 }
                 "--cluster" => {
                     let cluster = args

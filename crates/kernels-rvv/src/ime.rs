@@ -213,6 +213,7 @@ pub fn gemm_i8_ime<F>(
         let b = &b_packed[nt * stride..(nt + 1) * stride];
         for mt in 0..m_tiles {
             let a = &a_packed[mt * stride..(mt + 1) * stride];
+            #[cfg(target_arch = "riscv64")]
             let mut c = [0_i32; TILE_C];
             #[cfg(target_arch = "riscv64")]
             if hw_ime {
@@ -225,9 +226,7 @@ pub fn gemm_i8_ime<F>(
                 c = tile_dot_scalar(a, b, k_chunks);
             }
             #[cfg(not(target_arch = "riscv64"))]
-            {
-                c = tile_dot_scalar(a, b, k_chunks);
-            }
+            let c = tile_dot_scalar(a, b, k_chunks);
             issued += k_chunks as u64;
             sink(mt, nt, &c);
         }
