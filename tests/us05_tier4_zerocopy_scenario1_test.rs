@@ -34,7 +34,8 @@ fn test_tier4_scenario1_zerocopy_multiprocess_dispatch() {
     // Step 1: Memory Holder Domain (k3-kv) creates and locks shared arena
     // ------------------------------------------------------------------------
     let arena_size = 32768_usize; // 32 KiB test arena with conservative n_ctx=64
-    let mut kv_arena = SharedMemoryFixture::create("s1_kv_arena", arena_size).expect("k3-kv creates arena");
+    let mut kv_arena =
+        SharedMemoryFixture::create("s1_kv_arena", arena_size).expect("k3-kv creates arena");
 
     let initial_hdr = ArenaHeader {
         total_arena_bytes: arena_size as u64,
@@ -58,7 +59,8 @@ fn test_tier4_scenario1_zerocopy_multiprocess_dispatch() {
         kv_sock.as_raw_fd(),
         alloc_response,
         Some(kv_arena.as_raw_fd()),
-    ).expect("kv sends arena FD via SCM_RIGHTS");
+    )
+    .expect("kv sends arena FD via SCM_RIGHTS");
 
     let (kv_msg, mgr_received_fd) = SocketIpcHelper::recv_message_with_fd(mgr_kv_sock.as_raw_fd())
         .expect("mgr receives arena FD");
@@ -73,7 +75,8 @@ fn test_tier4_scenario1_zerocopy_multiprocess_dispatch() {
     // ------------------------------------------------------------------------
     // Step 3: k3-manager passes arena FD to k3-worker via SCM_RIGHTS over UDS
     // ------------------------------------------------------------------------
-    let (mgr_worker_sock, worker_sock) = SocketIpcHelper::create_socket_pair().expect("mgr <-> worker uds");
+    let (mgr_worker_sock, worker_sock) =
+        SocketIpcHelper::create_socket_pair().expect("mgr <-> worker uds");
     let attach_command = b"ATTACH_ARENA:model=synthetic-v1,size=32768,ctx=64";
     let dup_for_worker = mgr_arena.duplicate_fd().expect("dup for worker");
 
@@ -81,34 +84,37 @@ fn test_tier4_scenario1_zerocopy_multiprocess_dispatch() {
         mgr_worker_sock.as_raw_fd(),
         attach_command,
         Some(dup_for_worker.as_raw_fd()),
-    ).expect("mgr sends arena FD to worker");
+    )
+    .expect("mgr sends arena FD to worker");
 
-    let (worker_cmd, worker_received_fd) = SocketIpcHelper::recv_message_with_fd(worker_sock.as_raw_fd())
-        .expect("worker receives arena FD");
+    let (worker_cmd, worker_received_fd) =
+        SocketIpcHelper::recv_message_with_fd(worker_sock.as_raw_fd())
+            .expect("worker receives arena FD");
     assert_eq!(worker_cmd, attach_command);
     let worker_arena_fd = worker_received_fd.expect("worker must receive arena FD");
 
     // Worker maps shared memory arena
-    let mut worker_arena = SharedMemoryFixture::from_fd(worker_arena_fd, arena_size, "worker_arena")
-        .expect("worker maps arena");
+    let mut worker_arena =
+        SharedMemoryFixture::from_fd(worker_arena_fd, arena_size, "worker_arena")
+            .expect("worker maps arena");
     assert_eq!(worker_arena.header().magic, ARENA_MAGIC);
 
     // ------------------------------------------------------------------------
     // Step 4: Manager writes input prompt tokens to shared memory slot
     // ------------------------------------------------------------------------
     let prompt_tokens = [101_u32, 2054, 2003, 1037, 7000]; // 5 prompt tokens
-    mgr_arena.write_tokens(&prompt_tokens).expect("mgr writes tokens to shared slot");
+    mgr_arena
+        .write_tokens(&prompt_tokens)
+        .expect("mgr writes tokens to shared slot");
 
     // ------------------------------------------------------------------------
     // Step 5: Forward pass command dispatched over UDS (Zero Bulk Bytes Check)
     // ------------------------------------------------------------------------
     // Command carries ONLY metadata IDs and token counts — ZERO bulk tensor bytes!
     let forward_cmd = b"FORWARD_PASS:req=1001,slot=0,start_pos=0,count=5,prefill=true";
-    let bytes_sent_over_uds = SocketIpcHelper::send_message_with_fd(
-        mgr_worker_sock.as_raw_fd(),
-        forward_cmd,
-        None,
-    ).expect("mgr sends forward pass command");
+    let bytes_sent_over_uds =
+        SocketIpcHelper::send_message_with_fd(mgr_worker_sock.as_raw_fd(), forward_cmd, None)
+            .expect("mgr sends forward pass command");
 
     // Assertion 1: Total bytes sent over UDS control socket is strictly small metadata (< 128 bytes)
     assert!(
@@ -141,15 +147,15 @@ fn test_tier4_scenario1_zerocopy_multiprocess_dispatch() {
     }
 
     // Worker writes output logits directly in shared memory OutputSlab
-    worker_arena.write_logits(1001, &reference_logits).expect("worker writes logits in shared memory");
+    worker_arena
+        .write_logits(1001, &reference_logits)
+        .expect("worker writes logits in shared memory");
 
     // Worker signals completion back to manager via compact UDS frame
     let complete_msg = b"FORWARD_COMPLETED:req=1001,tokens=5,latency_ms=0.85";
-    let reply_bytes = SocketIpcHelper::send_message_with_fd(
-        worker_sock.as_raw_fd(),
-        complete_msg,
-        None,
-    ).expect("worker replies with completion");
+    let reply_bytes =
+        SocketIpcHelper::send_message_with_fd(worker_sock.as_raw_fd(), complete_msg, None)
+            .expect("worker replies with completion");
 
     // Assertion 2: Completion response over UDS is also compact (< 128 bytes)
     assert!(
@@ -157,8 +163,9 @@ fn test_tier4_scenario1_zerocopy_multiprocess_dispatch() {
         "Completion response must be compact metadata; observed: {reply_bytes} bytes"
     );
 
-    let (mgr_received_complete, _) = SocketIpcHelper::recv_message_with_fd(mgr_worker_sock.as_raw_fd())
-        .expect("mgr receives completion");
+    let (mgr_received_complete, _) =
+        SocketIpcHelper::recv_message_with_fd(mgr_worker_sock.as_raw_fd())
+            .expect("mgr receives completion");
     assert_eq!(mgr_received_complete, complete_msg);
 
     // ------------------------------------------------------------------------

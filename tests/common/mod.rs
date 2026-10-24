@@ -167,9 +167,11 @@ impl SharedMemoryFixture {
 
         #[cfg(target_os = "linux")]
         {
-            let cname = std::ffi::CString::new(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            let cname = std::ffi::CString::new(name)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
             // MFD_CLOEXEC = 1, MFD_ALLOW_SEALING = 2
-            let raw_fd = unsafe { libc::syscall(libc::SYS_memfd_create, cname.as_ptr(), 1 | 2) as i32 };
+            let raw_fd =
+                unsafe { libc::syscall(libc::SYS_memfd_create, cname.as_ptr(), 1 | 2) as i32 };
             if raw_fd >= 0 {
                 let ret = unsafe { libc::ftruncate(raw_fd, aligned_len as libc::off_t) };
                 if ret == 0 {
@@ -194,12 +196,19 @@ impl SharedMemoryFixture {
                         });
                     }
                 }
-                unsafe { libc::close(raw_fd); }
+                unsafe {
+                    libc::close(raw_fd);
+                }
             }
         }
 
         // Portable anonymous tempfile fallback (supports macOS & unprivileged Linux)
-        let temp_path = std::env::temp_dir().join(format!("k3_shm_{}_{}_{}.shm", name, std::process::id(), next_seq()));
+        let temp_path = std::env::temp_dir().join(format!(
+            "k3_shm_{}_{}_{}.shm",
+            name,
+            std::process::id(),
+            next_seq()
+        ));
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -332,7 +341,10 @@ impl SharedMemoryFixture {
         let hdr_size = std::mem::size_of::<TokenInputHeader>();
         let payload_size = std::mem::size_of_val(tokens);
         if offset + hdr_size + payload_size > self.len {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Token buffer exceeds arena bounds"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Token buffer exceeds arena bounds",
+            ));
         }
         let hdr = TokenInputHeader {
             slot_idx: 0,
@@ -369,7 +381,10 @@ impl SharedMemoryFixture {
         let hdr_size = std::mem::size_of::<OutputSlabHeader>();
         let payload_size = std::mem::size_of_val(logits);
         if offset + hdr_size + payload_size > self.len {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Logit buffer exceeds arena bounds"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Logit buffer exceeds arena bounds",
+            ));
         }
         let hdr = OutputSlabHeader {
             request_id: req_id,
@@ -391,7 +406,16 @@ impl SharedMemoryFixture {
         let offset = self.header().output_slabs_offset as usize;
         let hdr_size = std::mem::size_of::<OutputSlabHeader>();
         if offset + hdr_size > self.len {
-            return (OutputSlabHeader { request_id: 0, position: 0, vocab_size: 0, status: 0, reserved: 0 }, Vec::new());
+            return (
+                OutputSlabHeader {
+                    request_id: 0,
+                    position: 0,
+                    vocab_size: 0,
+                    status: 0,
+                    reserved: 0,
+                },
+                Vec::new(),
+            );
         }
         unsafe {
             let hdr = *(self.ptr.as_ptr().add(offset) as *const OutputSlabHeader);
@@ -421,7 +445,8 @@ impl SocketIpcHelper {
     /// Creates a connected bidirectional Unix stream socket pair.
     pub fn create_socket_pair() -> io::Result<(OwnedFd, OwnedFd)> {
         let mut fds = [0_i32; 2];
-        let ret = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        let ret =
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
         if ret != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -438,7 +463,11 @@ impl SocketIpcHelper {
     }
 
     /// Sends a length-prefixed payload over UDS, optionally passing a file descriptor via SCM_RIGHTS.
-    pub fn send_message_with_fd(sock: RawFd, payload: &[u8], fd_to_pass: Option<RawFd>) -> io::Result<usize> {
+    pub fn send_message_with_fd(
+        sock: RawFd,
+        payload: &[u8],
+        fd_to_pass: Option<RawFd>,
+    ) -> io::Result<usize> {
         let len_prefix = (payload.len() as u32).to_be_bytes();
         let mut full_payload = Vec::with_capacity(4 + payload.len());
         full_payload.extend_from_slice(&len_prefix);
@@ -507,7 +536,10 @@ impl SocketIpcHelper {
         let bytes_read = unsafe { libc::recvmsg(sock, &mut msg, 0) };
         if bytes_read <= 0 {
             if bytes_read == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Socket closed by peer"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Socket closed by peer",
+                ));
             }
             return Err(io::Error::last_os_error());
         }
@@ -523,7 +555,10 @@ impl SocketIpcHelper {
                 )
             };
             if n <= 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Truncated length prefix"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Truncated length prefix",
+                ));
             }
             total_hdr += n as usize;
         }
@@ -558,7 +593,10 @@ impl SocketIpcHelper {
                     )
                 };
                 if n <= 0 {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Truncated payload"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Truncated payload",
+                    ));
                 }
                 total += n as usize;
             }

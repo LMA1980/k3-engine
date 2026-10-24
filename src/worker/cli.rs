@@ -67,54 +67,72 @@ impl WorkerConfig {
                     return Ok(None);
                 }
                 "--socket" | "--socket-path" => {
-                    let path = args
-                        .next()
-                        .ok_or_else(|| WorkerError::InvalidArguments(format!("{arg} requires a path")))?;
+                    let path = args.next().ok_or_else(|| {
+                        WorkerError::InvalidArguments(format!("{arg} requires a path"))
+                    })?;
                     if path.trim().is_empty() {
-                        return Err(WorkerError::InvalidArguments(format!("{arg} path cannot be empty")));
+                        return Err(WorkerError::InvalidArguments(format!(
+                            "{arg} path cannot be empty"
+                        )));
                     }
                     config.socket_path = Some(PathBuf::from(path));
                 }
                 "--socket-fd" => {
-                    let fd_str = args
-                        .next()
-                        .ok_or_else(|| WorkerError::InvalidArguments("--socket-fd requires an integer fd".to_owned()))?;
-                    let fd = fd_str
-                        .parse::<RawFd>()
-                        .map_err(|e| WorkerError::InvalidArguments(format!("invalid --socket-fd '{fd_str}': {e}")))?;
+                    let fd_str = args.next().ok_or_else(|| {
+                        WorkerError::InvalidArguments(
+                            "--socket-fd requires an integer fd".to_owned(),
+                        )
+                    })?;
+                    let fd = fd_str.parse::<RawFd>().map_err(|e| {
+                        WorkerError::InvalidArguments(format!(
+                            "invalid --socket-fd '{fd_str}': {e}"
+                        ))
+                    })?;
                     if fd < 0 {
-                        return Err(WorkerError::InvalidArguments("--socket-fd must be non-negative".to_owned()));
+                        return Err(WorkerError::InvalidArguments(
+                            "--socket-fd must be non-negative".to_owned(),
+                        ));
                     }
                     config.socket_fd = Some(fd);
                 }
                 "--model" | "--weights-path" => {
-                    let path = args
-                        .next()
-                        .ok_or_else(|| WorkerError::InvalidArguments(format!("{arg} requires a path")))?;
+                    let path = args.next().ok_or_else(|| {
+                        WorkerError::InvalidArguments(format!("{arg} requires a path"))
+                    })?;
                     if path.trim().is_empty() {
-                        return Err(WorkerError::InvalidArguments(format!("{arg} path cannot be empty")));
+                        return Err(WorkerError::InvalidArguments(format!(
+                            "{arg} path cannot be empty"
+                        )));
                     }
                     config.model_path = PathBuf::from(path);
                 }
                 "--model-id" => {
-                    let _ = args
-                        .next()
-                        .ok_or_else(|| WorkerError::InvalidArguments("--model-id requires an identifier".to_owned()))?;
+                    let _ = args.next().ok_or_else(|| {
+                        WorkerError::InvalidArguments(
+                            "--model-id requires an identifier".to_owned(),
+                        )
+                    })?;
                 }
                 "--threads" => {
-                    let _ = args
-                        .next()
-                        .ok_or_else(|| WorkerError::InvalidArguments("--threads requires an integer count".to_owned()))?;
+                    let _ = args.next().ok_or_else(|| {
+                        WorkerError::InvalidArguments(
+                            "--threads requires an integer count".to_owned(),
+                        )
+                    })?;
                 }
                 "--memlock-limit" => {
-                    let _ = args
-                        .next()
-                        .ok_or_else(|| WorkerError::InvalidArguments("--memlock-limit requires a byte ceiling".to_owned()))?;
+                    let _ = args.next().ok_or_else(|| {
+                        WorkerError::InvalidArguments(
+                            "--memlock-limit requires a byte ceiling".to_owned(),
+                        )
+                    })?;
                 }
                 "--cluster" => {
-                    let cluster = args
-                        .next()
-                        .ok_or_else(|| WorkerError::InvalidArguments("--cluster requires a target (x100 or a100)".to_owned()))?;
+                    let cluster = args.next().ok_or_else(|| {
+                        WorkerError::InvalidArguments(
+                            "--cluster requires a target (x100 or a100)".to_owned(),
+                        )
+                    })?;
                     let cluster_lower = cluster.to_ascii_lowercase();
                     if cluster_lower != "x100" && cluster_lower != "a100" {
                         return Err(WorkerError::InvalidArguments(format!(
@@ -124,11 +142,15 @@ impl WorkerConfig {
                     config.cluster = cluster_lower;
                 }
                 "--affinity" => {
-                    let aff = args
-                        .next()
-                        .ok_or_else(|| WorkerError::InvalidArguments("--affinity requires a core or mask".to_owned()))?;
+                    let aff = args.next().ok_or_else(|| {
+                        WorkerError::InvalidArguments(
+                            "--affinity requires a core or mask".to_owned(),
+                        )
+                    })?;
                     if aff.trim().is_empty() {
-                        return Err(WorkerError::InvalidArguments("--affinity cannot be empty".to_owned()));
+                        return Err(WorkerError::InvalidArguments(
+                            "--affinity cannot be empty".to_owned(),
+                        ));
                     }
                     config.affinity = Some(aff);
                 }
@@ -139,14 +161,18 @@ impl WorkerConfig {
                     config.listen = true;
                 }
                 unknown => {
-                    return Err(WorkerError::InvalidArguments(format!("unknown option '{unknown}'")));
+                    return Err(WorkerError::InvalidArguments(format!(
+                        "unknown option '{unknown}'"
+                    )));
                 }
             }
         }
 
         // Validate required parameters
         if config.model_path.as_os_str().is_empty() {
-            return Err(WorkerError::InvalidArguments("missing required argument --model <path>".to_owned()));
+            return Err(WorkerError::InvalidArguments(
+                "missing required argument --model <path>".to_owned(),
+            ));
         }
 
         if config.socket_path.is_none() && config.socket_fd.is_none() {
@@ -198,20 +224,34 @@ mod tests {
     #[test]
     fn test_help_and_version() {
         let help_args = vec!["k3-worker".to_owned(), "--help".to_owned()];
-        assert_eq!(WorkerConfig::parse_args(help_args.into_iter()).unwrap(), None);
+        assert_eq!(
+            WorkerConfig::parse_args(help_args.into_iter()).unwrap(),
+            None
+        );
 
         let ver_args = vec!["k3-worker".to_owned(), "-V".to_owned()];
-        assert_eq!(WorkerConfig::parse_args(ver_args.into_iter()).unwrap(), None);
+        assert_eq!(
+            WorkerConfig::parse_args(ver_args.into_iter()).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn test_missing_required_args() {
         // Missing --model
-        let args = vec!["k3-worker".to_owned(), "--socket".to_owned(), "/tmp/test.sock".to_owned()];
+        let args = vec![
+            "k3-worker".to_owned(),
+            "--socket".to_owned(),
+            "/tmp/test.sock".to_owned(),
+        ];
         assert!(WorkerConfig::parse_args(args.into_iter()).is_err());
 
         // Missing --socket and --socket-fd
-        let args = vec!["k3-worker".to_owned(), "--model".to_owned(), "/tmp/model.gguf".to_owned()];
+        let args = vec![
+            "k3-worker".to_owned(),
+            "--model".to_owned(),
+            "/tmp/model.gguf".to_owned(),
+        ];
         assert!(WorkerConfig::parse_args(args.into_iter()).is_err());
     }
 

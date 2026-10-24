@@ -8,11 +8,12 @@ use std::time::Instant;
 
 use k3_core::ipc::arrow::wrap_tokens_as_uint32_array;
 use k3_core::ipc::layout::{
-    KvBlockTag, OutputSlabHeader, TokenInputSlotHeader, SLAB_STATUS_WRITTEN,
+    KvBlockTag, OutputSlabHeader, SLAB_STATUS_WRITTEN, TokenInputSlotHeader,
 };
 use k3_core::ipc::protocol::{
-    global_fory, recv_frame, send_frame, send_msg_frame, AttachArenaCommand, ForwardPassCommand,
-    ForwardPassCompleted, IpcMessage, StatusCode, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
+    AttachArenaCommand, ForwardPassCommand, ForwardPassCompleted, IpcMessage, StatusCode,
+    WorkerHeartbeatRequest, WorkerHeartbeatResponse, global_fory, recv_frame, send_frame,
+    send_msg_frame,
 };
 use k3_core::ipc::shm::SharedMemoryArena;
 use zerocopy::FromBytes;
@@ -81,16 +82,20 @@ impl WorkerEngine {
                     return Ok(());
                 }
                 Err(e) => {
-                    return Err(WorkerError::ProtocolError(format!("recv_frame failed: {e}")));
+                    return Err(WorkerError::ProtocolError(format!(
+                        "recv_frame failed: {e}"
+                    )));
                 }
             };
 
             match header.type_id {
                 // Type ID 201: AttachArenaCommand
                 201 => {
-                    let cmd: AttachArenaCommand = fory
-                        .deserialize(&payload)
-                        .map_err(|e| WorkerError::ProtocolError(format!("failed to decode AttachArenaCommand: {e}")))?;
+                    let cmd: AttachArenaCommand = fory.deserialize(&payload).map_err(|e| {
+                        WorkerError::ProtocolError(format!(
+                            "failed to decode AttachArenaCommand: {e}"
+                        ))
+                    })?;
 
                     let fd = opt_fd.ok_or_else(|| {
                         WorkerError::ProtocolError(
@@ -110,13 +115,16 @@ impl WorkerEngine {
                         WorkerError::ResourceExhausted("arena_bytes overflowed usize".to_owned())
                     })?;
 
-                    let arena = SharedMemoryArena::from_existing_fd(fd, len, "worker_arena", false)?;
+                    let arena =
+                        SharedMemoryArena::from_existing_fd(fd, len, "worker_arena", false)?;
                     self.arena = Some(arena);
 
                     // Send response frame (Type ID 206) with StatusCode::Success
                     let status_payload = (StatusCode::Success as u32).to_le_bytes();
                     send_frame(sock, 206, &status_payload, None).map_err(|e| {
-                        WorkerError::ProtocolError(format!("failed to send AttachArena response: {e}"))
+                        WorkerError::ProtocolError(format!(
+                            "failed to send AttachArena response: {e}"
+                        ))
                     })?;
                 }
 
@@ -125,34 +133,50 @@ impl WorkerEngine {
                     self.is_busy = true;
                     let start_time = Instant::now();
 
-                    let cmd: ForwardPassCommand = fory
-                        .deserialize(&payload)
-                        .map_err(|e| WorkerError::ProtocolError(format!("failed to decode ForwardPassCommand: {e}")))?;
+                    let cmd: ForwardPassCommand = fory.deserialize(&payload).map_err(|e| {
+                        WorkerError::ProtocolError(format!(
+                            "failed to decode ForwardPassCommand: {e}"
+                        ))
+                    })?;
 
                     if self.config.verbose {
                         eprintln!(
                             "[k3-worker] executing ForwardPassCommand: req={}, seq={}, offset={}, count={}, prefill={}",
-                            cmd.request_id, cmd.sequence_id, cmd.token_offset, cmd.token_count, cmd.is_prefill
+                            cmd.request_id,
+                            cmd.sequence_id,
+                            cmd.token_offset,
+                            cmd.token_count,
+                            cmd.is_prefill
                         );
                     }
 
                     let arena = self.arena.as_mut().ok_or_else(|| {
-                        WorkerError::ProtocolError("received ForwardPassCommand before AttachArenaCommand".to_owned())
+                        WorkerError::ProtocolError(
+                            "received ForwardPassCommand before AttachArenaCommand".to_owned(),
+                        )
                     })?;
 
                     let hdr = *arena.header()?;
-                    let vocab_size = if hdr.vocab_size > 0 { hdr.vocab_size as usize } else { 10 };
+                    let vocab_size = if hdr.vocab_size > 0 {
+                        hdr.vocab_size as usize
+                    } else {
+                        10
+                    };
 
                     // Zero-copy read tokens from TokenInputSlot using Apache Arrow UInt32Array view
-                    let tokens_slot_offset = usize::try_from(hdr.token_slots_offset).map_err(|e| {
-                        WorkerError::Internal(format!("invalid token_slots_offset: {e}"))
-                    })?;
+                    let tokens_slot_offset =
+                        usize::try_from(hdr.token_slots_offset).map_err(|e| {
+                            WorkerError::Internal(format!("invalid token_slots_offset: {e}"))
+                        })?;
 
                     // Decode slot header (16 bytes)
                     let slot_hdr_slice = arena.slice(tokens_slot_offset, 16)?;
-                    let slot_hdr = TokenInputSlotHeader::ref_from_bytes(slot_hdr_slice).map_err(|e| {
-                        WorkerError::ProtocolError(format!("failed to decode TokenInputSlotHeader: {e}"))
-                    })?;
+                    let slot_hdr =
+                        TokenInputSlotHeader::ref_from_bytes(slot_hdr_slice).map_err(|e| {
+                            WorkerError::ProtocolError(format!(
+                                "failed to decode TokenInputSlotHeader: {e}"
+                            ))
+                        })?;
 
                     let token_count = if cmd.token_count > 0 {
                         cmd.token_count as usize
@@ -191,7 +215,9 @@ impl WorkerEngine {
                     let next_token = logits
                         .iter()
                         .enumerate()
-                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .max_by(|(_, a), (_, b)| {
+                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                        })
                         .map(|(idx, _)| idx as u32)
                         .unwrap_or(0);
 
@@ -217,7 +243,9 @@ impl WorkerEngine {
                     // OutputSlabHeader (64 bytes aligned)
                     let slab_slice = arena.slice_mut(slab_offset, 64)?;
                     let slab_hdr = OutputSlabHeader::mut_from_bytes(slab_slice).map_err(|e| {
-                        WorkerError::ProtocolError(format!("failed to obtain mutable OutputSlabHeader: {e}"))
+                        WorkerError::ProtocolError(format!(
+                            "failed to obtain mutable OutputSlabHeader: {e}"
+                        ))
                     })?;
                     slab_hdr.request_id = cmd.request_id;
                     slab_hdr.vocab_size = vocab_size as u32;
@@ -252,7 +280,9 @@ impl WorkerEngine {
                     });
 
                     send_msg_frame(&stream, &reply, None).map_err(|e| {
-                        WorkerError::ProtocolError(format!("failed to send ForwardPassCompleted: {e}"))
+                        WorkerError::ProtocolError(format!(
+                            "failed to send ForwardPassCompleted: {e}"
+                        ))
                     })?;
 
                     self.completed_passes += 1;
@@ -261,9 +291,11 @@ impl WorkerEngine {
 
                 // Type ID 204: WorkerHeartbeatRequest
                 204 => {
-                    let req: WorkerHeartbeatRequest = fory
-                        .deserialize(&payload)
-                        .map_err(|e| WorkerError::ProtocolError(format!("failed to decode WorkerHeartbeatRequest: {e}")))?;
+                    let req: WorkerHeartbeatRequest = fory.deserialize(&payload).map_err(|e| {
+                        WorkerError::ProtocolError(format!(
+                            "failed to decode WorkerHeartbeatRequest: {e}"
+                        ))
+                    })?;
 
                     let resp = IpcMessage::WorkerHeartbeatResponse(WorkerHeartbeatResponse {
                         timestamp_ns: req.timestamp_ns,
@@ -272,7 +304,9 @@ impl WorkerEngine {
                     });
 
                     send_msg_frame(&stream, &resp, None).map_err(|e| {
-                        WorkerError::ProtocolError(format!("failed to send WorkerHeartbeatResponse: {e}"))
+                        WorkerError::ProtocolError(format!(
+                            "failed to send WorkerHeartbeatResponse: {e}"
+                        ))
                     })?;
                 }
 

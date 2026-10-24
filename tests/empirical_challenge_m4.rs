@@ -15,15 +15,14 @@ use std::thread;
 use std::time::Duration;
 
 use k3_core::ipc::layout::{
-    ArenaHeader, KvBlockTag, OutputSlabHeader, TokenInputSlotHeader, ARENA_MAGIC,
-    ARENA_VERSION, SLAB_STATUS_WRITTEN,
+    ARENA_MAGIC, ARENA_VERSION, ArenaHeader, KvBlockTag, OutputSlabHeader, SLAB_STATUS_WRITTEN,
+    TokenInputSlotHeader,
 };
 use k3_core::ipc::protocol::{
-    global_fory, recv_frame, recv_msg_frame, send_frame, send_msg_frame,
-    AttachArenaCommand, ForwardPassCommand, IpcMessage, StatusCode, WorkerHeartbeatRequest,
-    ShutdownCommand,
+    AttachArenaCommand, ForwardPassCommand, IpcMessage, ShutdownCommand, StatusCode,
+    WorkerHeartbeatRequest, global_fory, recv_frame, recv_msg_frame, send_frame, send_msg_frame,
 };
-use k3_core::ipc::shm::{SharedMemoryArena, DEFAULT_LIMIT_MEMLOCK_BYTES};
+use k3_core::ipc::shm::{DEFAULT_LIMIT_MEMLOCK_BYTES, SharedMemoryArena};
 use zerocopy::{FromBytes, IntoBytes};
 
 const BIN_PATH: &str = env!("CARGO_BIN_EXE_k3-worker");
@@ -32,7 +31,8 @@ const BIN_PATH: &str = env!("CARGO_BIN_EXE_k3-worker");
 fn create_dummy_model(name: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(name);
     let mut f = File::create(&path).expect("create dummy model");
-    f.write_all(b"CHALLENGER_EMPIRICAL_TEST_MODEL_V3").expect("write dummy model");
+    f.write_all(b"CHALLENGER_EMPIRICAL_TEST_MODEL_V3")
+        .expect("write dummy model");
     path
 }
 
@@ -203,28 +203,155 @@ fn test_challenge_exit_2_boundary_matrix() {
         (&["--model", valid_m], "missing socket"),
         (&["--socket", "/tmp/k3.sock"], "missing model"),
         // Empty strings
-        (&["--model", "", "--socket", "/tmp/k3.sock"], "empty model path"),
-        (&["--model", "   ", "--socket", "/tmp/k3.sock"], "whitespace model path"),
+        (
+            &["--model", "", "--socket", "/tmp/k3.sock"],
+            "empty model path",
+        ),
+        (
+            &["--model", "   ", "--socket", "/tmp/k3.sock"],
+            "whitespace model path",
+        ),
         (&["--model", valid_m, "--socket", ""], "empty socket path"),
-        (&["--model", valid_m, "--socket", "   "], "whitespace socket path"),
+        (
+            &["--model", valid_m, "--socket", "   "],
+            "whitespace socket path",
+        ),
         // Socket FD invalid
-        (&["--model", valid_m, "--socket-fd", "not_a_number"], "non-numeric socket fd"),
-        (&["--model", valid_m, "--socket-fd", "-1"], "negative socket fd"),
+        (
+            &["--model", valid_m, "--socket-fd", "not_a_number"],
+            "non-numeric socket fd",
+        ),
+        (
+            &["--model", valid_m, "--socket-fd", "-1"],
+            "negative socket fd",
+        ),
         // Cluster invalid
-        (&["--model", valid_m, "--socket", "/tmp/k3.sock", "--cluster", "cuda"], "unsupported cluster cuda"),
-        (&["--model", valid_m, "--socket", "/tmp/k3.sock", "--cluster", "x200"], "unsupported cluster x200"),
-        (&["--model", valid_m, "--socket", "/tmp/k3.sock", "--cluster", ""], "empty cluster"),
+        (
+            &[
+                "--model",
+                valid_m,
+                "--socket",
+                "/tmp/k3.sock",
+                "--cluster",
+                "cuda",
+            ],
+            "unsupported cluster cuda",
+        ),
+        (
+            &[
+                "--model",
+                valid_m,
+                "--socket",
+                "/tmp/k3.sock",
+                "--cluster",
+                "x200",
+            ],
+            "unsupported cluster x200",
+        ),
+        (
+            &[
+                "--model",
+                valid_m,
+                "--socket",
+                "/tmp/k3.sock",
+                "--cluster",
+                "",
+            ],
+            "empty cluster",
+        ),
         // Affinity invalid
-        (&["--model", valid_m, "--socket", "/tmp/k3.sock", "--affinity", ""], "empty affinity"),
-        (&["--model", valid_m, "--socket", "/tmp/k3.sock", "--affinity", "   "], "whitespace affinity"),
-        (&["--model", valid_m, "--socket", "/tmp/k3.sock", "--affinity", "64"], "core index >= 64"),
-        (&["--model", valid_m, "--socket", "/tmp/k3.sock", "--affinity", "128"], "core index 128"),
-        (&["--model", valid_m, "--socket", "/tmp/k3.sock", "--affinity", "0x0"], "zero hex affinity mask"),
-        (&["--model", valid_m, "--socket", "/tmp/k3.sock", "--affinity", "0X00"], "zero hex affinity mask upper"),
-        (&["--model", valid_m, "--socket", "/tmp/k3.sock", "--affinity", "xyz"], "malformed affinity string"),
+        (
+            &[
+                "--model",
+                valid_m,
+                "--socket",
+                "/tmp/k3.sock",
+                "--affinity",
+                "",
+            ],
+            "empty affinity",
+        ),
+        (
+            &[
+                "--model",
+                valid_m,
+                "--socket",
+                "/tmp/k3.sock",
+                "--affinity",
+                "   ",
+            ],
+            "whitespace affinity",
+        ),
+        (
+            &[
+                "--model",
+                valid_m,
+                "--socket",
+                "/tmp/k3.sock",
+                "--affinity",
+                "64",
+            ],
+            "core index >= 64",
+        ),
+        (
+            &[
+                "--model",
+                valid_m,
+                "--socket",
+                "/tmp/k3.sock",
+                "--affinity",
+                "128",
+            ],
+            "core index 128",
+        ),
+        (
+            &[
+                "--model",
+                valid_m,
+                "--socket",
+                "/tmp/k3.sock",
+                "--affinity",
+                "0x0",
+            ],
+            "zero hex affinity mask",
+        ),
+        (
+            &[
+                "--model",
+                valid_m,
+                "--socket",
+                "/tmp/k3.sock",
+                "--affinity",
+                "0X00",
+            ],
+            "zero hex affinity mask upper",
+        ),
+        (
+            &[
+                "--model",
+                valid_m,
+                "--socket",
+                "/tmp/k3.sock",
+                "--affinity",
+                "xyz",
+            ],
+            "malformed affinity string",
+        ),
         // Unknown arguments
-        (&["--model", valid_m, "--socket", "/tmp/k3.sock", "--invalid-flag"], "unrecognized flag"),
-        (&["--model", valid_m, "--socket", "/tmp/k3.sock", "-Z"], "unrecognized short flag"),
+        (
+            &[
+                "--model",
+                valid_m,
+                "--socket",
+                "/tmp/k3.sock",
+                "--invalid-flag",
+            ],
+            "unrecognized flag",
+        ),
+        (
+            &["--model", valid_m, "--socket", "/tmp/k3.sock", "-Z"],
+            "unrecognized short flag",
+        ),
     ];
 
     for (args, desc) in invalid_cli_cases {
@@ -256,26 +383,59 @@ fn test_challenge_exit_10_capability_mismatch() {
         // 3.1 Requesting A100 cluster on non-riscv64 host
         let res = Command::new(BIN_PATH)
             .env_remove("K3_SIMULATE_A100")
-            .args(["--model", m_str, "--socket", "/tmp/test10.sock", "--cluster", "a100"])
+            .args([
+                "--model",
+                m_str,
+                "--socket",
+                "/tmp/test10.sock",
+                "--cluster",
+                "a100",
+            ])
             .output()
             .unwrap();
-        assert_eq!(res.status.code(), Some(10), "a100 on non-riscv64 must exit 10");
+        assert_eq!(
+            res.status.code(),
+            Some(10),
+            "a100 on non-riscv64 must exit 10"
+        );
 
         // 3.2 Requesting core 8 (Cluster 1) on non-riscv64 host
         let res = Command::new(BIN_PATH)
             .env_remove("K3_SIMULATE_A100")
-            .args(["--model", m_str, "--socket", "/tmp/test10.sock", "--affinity", "8"])
+            .args([
+                "--model",
+                m_str,
+                "--socket",
+                "/tmp/test10.sock",
+                "--affinity",
+                "8",
+            ])
             .output()
             .unwrap();
-        assert_eq!(res.status.code(), Some(10), "core 8 on non-riscv64 must exit 10");
+        assert_eq!(
+            res.status.code(),
+            Some(10),
+            "core 8 on non-riscv64 must exit 10"
+        );
 
         // 3.3 Requesting core mask 0xFF00 (Cluster 1) on non-riscv64 host
         let res = Command::new(BIN_PATH)
             .env_remove("K3_SIMULATE_A100")
-            .args(["--model", m_str, "--socket", "/tmp/test10.sock", "--affinity", "0xFF00"])
+            .args([
+                "--model",
+                m_str,
+                "--socket",
+                "/tmp/test10.sock",
+                "--affinity",
+                "0xFF00",
+            ])
             .output()
             .unwrap();
-        assert_eq!(res.status.code(), Some(10), "0xFF00 on non-riscv64 must exit 10");
+        assert_eq!(
+            res.status.code(),
+            Some(10),
+            "0xFF00 on non-riscv64 must exit 10"
+        );
     }
 
     // 3.4 Exclusive lock conflict: LOCK_EX held by another process
@@ -284,10 +444,21 @@ fn test_challenge_exit_10_capability_mismatch() {
     assert_eq!(lock_ret, 0, "Test acquired exclusive flock");
 
     let res = Command::new(BIN_PATH)
-        .args(["--model", m_str, "--socket", "/tmp/test10.sock", "--cluster", "x100"])
+        .args([
+            "--model",
+            m_str,
+            "--socket",
+            "/tmp/test10.sock",
+            "--cluster",
+            "x100",
+        ])
         .output()
         .unwrap();
-    assert_eq!(res.status.code(), Some(10), "flock(LOCK_EX) conflict must exit 10");
+    assert_eq!(
+        res.status.code(),
+        Some(10),
+        "flock(LOCK_EX) conflict must exit 10"
+    );
 
     unsafe { libc::flock(f_lock.as_raw_fd(), libc::LOCK_UN) };
     drop(f_lock);
@@ -306,7 +477,8 @@ fn test_challenge_exit_11_memlock_ceiling_exceeded() {
     // Create a 29 GiB sparse file (exceeding 28 GiB LimitMEMLOCK)
     // 28 GiB = DEFAULT_LIMIT_MEMLOCK_BYTES = 30_064_771_072 bytes
     let excess_len = DEFAULT_LIMIT_MEMLOCK_BYTES + (1024 * 1024); // 28 GiB + 1 MiB
-    file.set_len(excess_len).expect("set sparse file length to 28.001 GiB");
+    file.set_len(excess_len)
+        .expect("set sparse file length to 28.001 GiB");
 
     let output = Command::new(BIN_PATH)
         .args([
@@ -329,7 +501,8 @@ fn test_challenge_exit_11_memlock_ceiling_exceeded() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("exceeds operator LimitMEMLOCK bound") || stderr.contains("insufficient lockable memory"),
+        stderr.contains("exceeds operator LimitMEMLOCK bound")
+            || stderr.contains("insufficient lockable memory"),
         "stderr should mention LimitMEMLOCK ceiling: {stderr}"
     );
 }
@@ -349,7 +522,11 @@ fn test_challenge_exit_12_resource_exhausted() {
         ])
         .output()
         .unwrap();
-    assert_eq!(res.status.code(), Some(12), "Missing model file must exit 12");
+    assert_eq!(
+        res.status.code(),
+        Some(12),
+        "Missing model file must exit 12"
+    );
 
     // 5.2 0-byte file
     let empty_path = std::env::temp_dir().join("k3_worker_0byte_file.gguf");
@@ -366,7 +543,11 @@ fn test_challenge_exit_12_resource_exhausted() {
         .unwrap();
 
     let _ = std::fs::remove_file(&empty_path);
-    assert_eq!(res.status.code(), Some(12), "0-byte model file must exit 12");
+    assert_eq!(
+        res.status.code(),
+        Some(12),
+        "0-byte model file must exit 12"
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -462,7 +643,9 @@ fn test_challenge_exit_13_protocol_error() {
 
     send_frame(stream2.as_raw_fd(), fwd_type, &fwd_payload, None).expect("send forward command");
 
-    let exit_status2 = child2.wait().expect("wait for child 2 after premature forward command");
+    let exit_status2 = child2
+        .wait()
+        .expect("wait for child 2 after premature forward command");
     assert_eq!(
         exit_status2.code(),
         Some(13),
@@ -484,18 +667,38 @@ fn test_challenge_concurrent_workers_shared_lock() {
 
     let sock1 = std::env::temp_dir().join("k3_worker_sh1.sock");
     let sock2 = std::env::temp_dir().join("k3_worker_sh2.sock");
-    if sock1.exists() { let _ = std::fs::remove_file(&sock1); }
-    if sock2.exists() { let _ = std::fs::remove_file(&sock2); }
+    if sock1.exists() {
+        let _ = std::fs::remove_file(&sock1);
+    }
+    if sock2.exists() {
+        let _ = std::fs::remove_file(&sock2);
+    }
 
     // Spawn Worker 1
     let mut child1 = Command::new(BIN_PATH)
-        .args(["--model", m_str, "--socket", sock1.to_str().unwrap(), "--listen", "--cluster", "x100"])
+        .args([
+            "--model",
+            m_str,
+            "--socket",
+            sock1.to_str().unwrap(),
+            "--listen",
+            "--cluster",
+            "x100",
+        ])
         .spawn()
         .expect("spawn worker 1");
 
     // Spawn Worker 2 on the exact same model file
     let mut child2 = Command::new(BIN_PATH)
-        .args(["--model", m_str, "--socket", sock2.to_str().unwrap(), "--listen", "--cluster", "x100"])
+        .args([
+            "--model",
+            m_str,
+            "--socket",
+            sock2.to_str().unwrap(),
+            "--listen",
+            "--cluster",
+            "x100",
+        ])
         .spawn()
         .expect("spawn worker 2");
 
@@ -504,10 +707,14 @@ fn test_challenge_concurrent_workers_shared_lock() {
     let mut s2_opt = None;
     for _ in 0..50 {
         if s1_opt.is_none() && sock1.exists() {
-            if let Ok(s) = UnixStream::connect(&sock1) { s1_opt = Some(s); }
+            if let Ok(s) = UnixStream::connect(&sock1) {
+                s1_opt = Some(s);
+            }
         }
         if s2_opt.is_none() && sock2.exists() {
-            if let Ok(s) = UnixStream::connect(&sock2) { s2_opt = Some(s); }
+            if let Ok(s) = UnixStream::connect(&sock2) {
+                s2_opt = Some(s);
+            }
         }
         if s1_opt.is_some() && s2_opt.is_some() {
             break;
@@ -560,11 +767,14 @@ fn test_challenge_e2e_prefill_and_decode_pipeline() {
         .expect("spawn worker connecting to supervisor");
 
     // 3. Supervisor accepts connection from worker
-    let (stream, _) = supervisor_listener.accept().expect("supervisor accepted worker");
+    let (stream, _) = supervisor_listener
+        .accept()
+        .expect("supervisor accepted worker");
 
     // 4. Create and attach shared memory arena via SCM_RIGHTS
     let arena_size = 65536_usize;
-    let mut arena = SharedMemoryArena::create("challenger_m4_arena", arena_size).expect("create arena");
+    let mut arena =
+        SharedMemoryArena::create("challenger_m4_arena", arena_size).expect("create arena");
 
     let header = ArenaHeader {
         magic: ARENA_MAGIC,
@@ -599,13 +809,24 @@ fn test_challenge_e2e_prefill_and_decode_pipeline() {
         .serialize(global_fory())
         .unwrap();
 
-    send_frame(stream.as_raw_fd(), cmd_type, &payload, Some(dup_fd.as_raw_fd()))
-        .expect("send AttachArenaCommand with FD");
+    send_frame(
+        stream.as_raw_fd(),
+        cmd_type,
+        &payload,
+        Some(dup_fd.as_raw_fd()),
+    )
+    .expect("send AttachArenaCommand with FD");
 
     // Receive AttachArenaResponse (Type ID 206)
-    let (resp_hdr, resp_payload, _) = recv_frame(stream.as_raw_fd()).expect("recv AttachArena response");
+    let (resp_hdr, resp_payload, _) =
+        recv_frame(stream.as_raw_fd()).expect("recv AttachArena response");
     assert_eq!(resp_hdr.type_id, 206);
-    let status = u32::from_le_bytes([resp_payload[0], resp_payload[1], resp_payload[2], resp_payload[3]]);
+    let status = u32::from_le_bytes([
+        resp_payload[0],
+        resp_payload[1],
+        resp_payload[2],
+        resp_payload[3],
+    ]);
     assert_eq!(status, StatusCode::Success as u32);
 
     // 5. Test Pass 1: Prefill Forward Pass (16 prompt tokens)
@@ -619,7 +840,9 @@ fn test_challenge_e2e_prefill_and_decode_pipeline() {
     let slot_slice = arena.slice_mut(slot_offset, 16).unwrap();
     slot_slice.copy_from_slice(slot_hdr.as_bytes());
 
-    let tokens_slice = arena.slice_mut(slot_offset + 16, prompt_tokens.len() * 4).unwrap();
+    let tokens_slice = arena
+        .slice_mut(slot_offset + 16, prompt_tokens.len() * 4)
+        .unwrap();
     for (i, &t) in prompt_tokens.iter().enumerate() {
         tokens_slice[i * 4..(i + 1) * 4].copy_from_slice(&t.to_ne_bytes());
     }
@@ -637,7 +860,10 @@ fn test_challenge_e2e_prefill_and_decode_pipeline() {
         .unwrap();
 
     // Verify zero bulk payload over UDS: command frame is < 128 bytes
-    assert!(12 + payload.len() < 128, "Prefill frame must be compact control metadata");
+    assert!(
+        12 + payload.len() < 128,
+        "Prefill frame must be compact control metadata"
+    );
     send_frame(stream.as_raw_fd(), cmd_type, &payload, None).expect("send prefill command");
 
     let (msg, _) = recv_msg_frame(&stream).expect("recv prefill completed");
@@ -733,7 +959,11 @@ fn test_challenge_e2e_prefill_and_decode_pipeline() {
     send_msg_frame(&stream, &shutdown, None).expect("send shutdown");
 
     let exit_status = child.wait().expect("wait for child after shutdown");
-    assert_eq!(exit_status.code(), Some(0), "Worker must exit 0 on ShutdownCommand");
+    assert_eq!(
+        exit_status.code(),
+        Some(0),
+        "Worker must exit 0 on ShutdownCommand"
+    );
 
     let _ = std::fs::remove_file(&model_path);
     let _ = std::fs::remove_file(&sock_path);

@@ -1,7 +1,4 @@
-#![allow(
-    clippy::pedantic,
-    clippy::undocumented_unsafe_blocks
-)]
+#![allow(clippy::pedantic, clippy::undocumented_unsafe_blocks)]
 
 use std::fs::File;
 use std::io::Write;
@@ -71,14 +68,27 @@ fn test_cli_invalid_args_exit_2() {
 
     // Invalid cluster target
     let output = Command::new(BIN_PATH)
-        .args(["--model", "/tmp/fake.gguf", "--socket", "/tmp/test.sock", "--cluster", "cuda"])
+        .args([
+            "--model",
+            "/tmp/fake.gguf",
+            "--socket",
+            "/tmp/test.sock",
+            "--cluster",
+            "cuda",
+        ])
         .output()
         .expect("run k3-worker invalid cluster");
     assert_eq!(output.status.code(), Some(2));
 
     // Unknown option
     let output = Command::new(BIN_PATH)
-        .args(["--model", "/tmp/fake.gguf", "--socket", "/tmp/test.sock", "--bogus-flag"])
+        .args([
+            "--model",
+            "/tmp/fake.gguf",
+            "--socket",
+            "/tmp/test.sock",
+            "--bogus-flag",
+        ])
         .output()
         .expect("run k3-worker unknown flag");
     assert_eq!(output.status.code(), Some(2));
@@ -88,7 +98,12 @@ fn test_cli_invalid_args_exit_2() {
 fn test_model_not_found_or_empty_exit_12() {
     // Non-existent model file -> exit code 12
     let output = Command::new(BIN_PATH)
-        .args(["--model", "/path/to/nonexistent/weights.gguf", "--socket", "/tmp/fake.sock"])
+        .args([
+            "--model",
+            "/path/to/nonexistent/weights.gguf",
+            "--socket",
+            "/tmp/fake.sock",
+        ])
         .output()
         .expect("run k3-worker nonexistent model");
     assert_eq!(output.status.code(), Some(12));
@@ -97,7 +112,12 @@ fn test_model_not_found_or_empty_exit_12() {
     let empty_path = std::env::temp_dir().join("k3_worker_test_empty.gguf");
     File::create(&empty_path).unwrap();
     let output = Command::new(BIN_PATH)
-        .args(["--model", empty_path.to_str().unwrap(), "--socket", "/tmp/fake.sock"])
+        .args([
+            "--model",
+            empty_path.to_str().unwrap(),
+            "--socket",
+            "/tmp/fake.sock",
+        ])
         .output()
         .expect("run k3-worker empty model");
     let _ = std::fs::remove_file(&empty_path);
@@ -206,7 +226,11 @@ fn test_signal_termination_sigint_and_sigterm_exit_0() {
     }
 
     for &sig in &[libc::SIGINT, libc::SIGTERM] {
-        let sig_name = if sig == libc::SIGINT { "SIGINT" } else { "SIGTERM" };
+        let sig_name = if sig == libc::SIGINT {
+            "SIGINT"
+        } else {
+            "SIGTERM"
+        };
         let sock_path = std::env::temp_dir().join(format!("k3_worker_sig_{sig_name}.sock"));
         if sock_path.exists() {
             let _ = std::fs::remove_file(&sock_path);
@@ -267,7 +291,10 @@ fn test_signal_termination_sigint_and_sigterm_exit_0() {
             Some(0),
             "{sig_name} must exit cleanly with code 0"
         );
-        assert!(exited, "{sig_name} termination timed out (> 2 seconds), deadlock detected");
+        assert!(
+            exited,
+            "{sig_name} termination timed out (> 2 seconds), deadlock detected"
+        );
 
         if sock_path.exists() {
             let _ = std::fs::remove_file(&sock_path);
@@ -276,4 +303,3 @@ fn test_signal_termination_sigint_and_sigterm_exit_0() {
 
     let _ = std::fs::remove_file(&model_path);
 }
-

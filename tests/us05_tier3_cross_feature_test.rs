@@ -43,11 +43,14 @@ fn test_pair1_core_affinity_and_shared_memory_access() {
 
     // Simulate X100 worker writing input prompt tokens to shared memory slot
     let x100_tokens = [10_u32, 20, 30, 40];
-    arena.write_tokens(&x100_tokens).expect("x100 writes tokens");
+    arena
+        .write_tokens(&x100_tokens)
+        .expect("x100 writes tokens");
 
     // Duplicate descriptor for A100 matrix worker
     let dup_fd = arena.duplicate_fd().expect("dup fd");
-    let mut a100_arena = SharedMemoryFixture::from_fd(dup_fd, arena.len(), "a100_map").expect("a100 map");
+    let mut a100_arena =
+        SharedMemoryFixture::from_fd(dup_fd, arena.len(), "a100_map").expect("a100 map");
 
     // A100 worker reads the tokens written by X100 worker without IPC copy
     let read_tokens = a100_arena.read_tokens();
@@ -55,7 +58,9 @@ fn test_pair1_core_affinity_and_shared_memory_access() {
 
     // A100 worker writes output logits directly into shared memory slab
     let a100_logits = [1.25_f32, 3.50, -2.00, 0.00];
-    a100_arena.write_logits(101, &a100_logits).expect("a100 writes logits");
+    a100_arena
+        .write_logits(101, &a100_logits)
+        .expect("a100 writes logits");
 
     // X100 worker / manager reads logits directly from original arena
     let (hdr, logits) = arena.read_logits();
@@ -84,7 +89,10 @@ fn test_pair2_multimodel_isolation_and_memlock_budget() {
     // Attempting Model C with 10 GiB exceeds 28 GiB ceiling (10 + 12 + 10 = 32 > 28)
     let model_c_budget: u64 = 10 * 1024 * 1024 * 1024;
     let exceeds = combined_active_bytes + model_c_budget > memlock_ceiling_bytes;
-    assert!(exceeds, "Admission control must refuse allocation exceeding 28 GiB");
+    assert!(
+        exceeds,
+        "Admission control must refuse allocation exceeding 28 GiB"
+    );
 
     let err = K3Error::InsufficientLockableMemory {
         required_bytes: combined_active_bytes + model_c_budget,
@@ -129,9 +137,12 @@ fn test_pair3_columnar_views_and_zerocopy_mutations() {
 
     // 4. In-place logit normalization / softmax mutation
     let initial_logits = [2.0_f32, 4.0, 6.0];
-    arena.write_logits(42, &initial_logits).expect("write logits");
+    arena
+        .write_logits(42, &initial_logits)
+        .expect("write logits");
 
-    let logit_offset = arena.header().output_slabs_offset as usize + std::mem::size_of::<OutputSlabHeader>();
+    let logit_offset =
+        arena.header().output_slabs_offset as usize + std::mem::size_of::<OutputSlabHeader>();
     unsafe {
         let logits_ptr = arena.as_ptr().add(logit_offset) as *mut f32;
         *logits_ptr = 10.0; // In-place update to first logit
@@ -169,13 +180,20 @@ fn test_pair4_checkpoint_rng_state_and_worker_reattachment() {
 
     // k3-manager passes arena FD to replacement worker via SCM_RIGHTS
     let (mgr_sock, repl_sock) = SocketIpcHelper::create_socket_pair().expect("uds pair");
-    SocketIpcHelper::send_message_with_fd(mgr_sock.as_raw_fd(), b"ATTACH_RESUME:pos=37", Some(arena.as_raw_fd())).expect("send");
-    let (cmd, received_fd) = SocketIpcHelper::recv_message_with_fd(repl_sock.as_raw_fd()).expect("recv");
+    SocketIpcHelper::send_message_with_fd(
+        mgr_sock.as_raw_fd(),
+        b"ATTACH_RESUME:pos=37",
+        Some(arena.as_raw_fd()),
+    )
+    .expect("send");
+    let (cmd, received_fd) =
+        SocketIpcHelper::recv_message_with_fd(repl_sock.as_raw_fd()).expect("recv");
     assert_eq!(cmd, b"ATTACH_RESUME:pos=37");
     assert!(received_fd.is_some());
 
     // Replacement worker maps arena and verifies checkpoint state
-    let repl_arena = SharedMemoryFixture::from_fd(received_fd.unwrap(), arena.len(), "repl_shm").expect("map");
+    let repl_arena =
+        SharedMemoryFixture::from_fd(received_fd.unwrap(), arena.len(), "repl_shm").expect("map");
     let repl_block = repl_arena.block_meta(0).expect("repl block");
     assert_eq!(repl_block.committed_tokens, 37);
     assert_eq!(repl_block.sampler_rng_state, expected_rng_state);
@@ -201,17 +219,27 @@ fn test_pair5_advisory_file_locking_and_crash_recovery() {
 
     // Garbage collector probe confirms LOCK_EX is blocked
     let gc_probe = File::open(&temp_weight).expect("open gc");
-    let lock_ex_blocked = unsafe { libc::flock(gc_probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    assert_ne!(lock_ex_blocked, 0, "LOCK_EX must be blocked while worker holds LOCK_SH");
+    let lock_ex_blocked =
+        unsafe { libc::flock(gc_probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_ne!(
+        lock_ex_blocked, 0,
+        "LOCK_EX must be blocked while worker holds LOCK_SH"
+    );
 
     // Worker process crashes: OS closes open file descriptors and releases lock automatically
     drop(worker_file);
 
     // Garbage collector probe now successfully acquires LOCK_EX
-    let lock_ex_success = unsafe { libc::flock(gc_probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    assert_eq!(lock_ex_success, 0, "GC acquires LOCK_EX once worker terminates");
+    let lock_ex_success =
+        unsafe { libc::flock(gc_probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(
+        lock_ex_success, 0,
+        "GC acquires LOCK_EX once worker terminates"
+    );
 
-    unsafe { libc::flock(gc_probe.as_raw_fd(), libc::LOCK_UN); }
+    unsafe {
+        libc::flock(gc_probe.as_raw_fd(), libc::LOCK_UN);
+    }
     let _ = std::fs::remove_file(&temp_weight);
 }
 
@@ -232,14 +260,17 @@ fn test_pair6_binary_framing_and_scm_rights_migration() {
         sender.as_raw_fd(),
         control_frame,
         Some(arena.as_raw_fd()),
-    ).expect("send atomic");
+    )
+    .expect("send atomic");
 
     // Receiver decodes frame and captures file descriptor
-    let (payload, received_fd) = SocketIpcHelper::recv_message_with_fd(receiver.as_raw_fd()).expect("recv atomic");
+    let (payload, received_fd) =
+        SocketIpcHelper::recv_message_with_fd(receiver.as_raw_fd()).expect("recv atomic");
     assert_eq!(payload, control_frame);
     let raw_fd = received_fd.expect("must receive FD");
 
     // Receiver maps the transferred descriptor and verifies magic bytes
-    let mapped = SharedMemoryFixture::from_fd(raw_fd, 8192, "mapped_receiver").expect("map receiver");
+    let mapped =
+        SharedMemoryFixture::from_fd(raw_fd, 8192, "mapped_receiver").expect("map receiver");
     assert_eq!(&mapped.as_slice()[0..4], &ARENA_MAGIC);
 }

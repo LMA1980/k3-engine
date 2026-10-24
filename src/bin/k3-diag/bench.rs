@@ -557,7 +557,12 @@ pub(crate) fn run_matrix_benchmark<W: Write>(
     } else {
         prefill_ms / prompt_tokens.len() as f64
     };
-    let mean_decode_steps = mean(primary.summaries.iter().map(|s| s.timing.decode_steps as f64));
+    let mean_decode_steps = mean(
+        primary
+            .summaries
+            .iter()
+            .map(|s| s.timing.decode_steps as f64),
+    );
     let decode_cost_per_token_ms = if mean_decode_steps > 0.0 {
         decode_ms / mean_decode_steps
     } else {
@@ -665,9 +670,7 @@ pub(crate) fn run_matrix_benchmark<W: Write>(
     let quantization_level =
         QuantizationInfo::from_descriptors(locked_weights.metadata().tensors());
 
-    let split_strategy_str = split_name
-        .clone()
-        .unwrap_or_else(|| "none".to_owned());
+    let split_strategy_str = split_name.clone().unwrap_or_else(|| "none".to_owned());
 
     let cluster_placement = ClusterPlacement {
         cluster: cluster.clone(),
@@ -711,7 +714,14 @@ pub(crate) fn run_matrix_benchmark<W: Write>(
         peak_resident_bytes,
     };
 
-    let (bottleneck_classification, recommended_cluster, recommended_split, recommended_ime, rationale, recommendations) = {
+    let (
+        bottleneck_classification,
+        recommended_cluster,
+        recommended_split,
+        recommended_ime,
+        rationale,
+        recommendations,
+    ) = {
         let bottleneck = if decode.ceiling_pct >= prefill.ceiling_pct {
             "bandwidth-bound"
         } else {
@@ -729,7 +739,10 @@ pub(crate) fn run_matrix_benchmark<W: Write>(
             "a100" => ("a100".to_owned(), None, true),
             "both" => (
                 "both".to_owned(),
-                config.split.map(|s| s.as_str().to_owned()).or_else(|| Some("phase".to_owned())),
+                config
+                    .split
+                    .map(|s| s.as_str().to_owned())
+                    .or_else(|| Some("phase".to_owned())),
                 true,
             ),
             _ => ("both".to_owned(), Some("phase".to_owned()), true),
@@ -754,7 +767,14 @@ pub(crate) fn run_matrix_benchmark<W: Write>(
         }
         recs.push("Operator tuning authority (ADR-032): These recommendations are advisory only; operator configuration remains authoritative.".to_owned());
 
-        (bottleneck.to_owned(), rec_cluster, rec_split, rec_ime, rat, recs)
+        (
+            bottleneck.to_owned(),
+            rec_cluster,
+            rec_split,
+            rec_ime,
+            rat,
+            recs,
+        )
     };
 
     let tuning_advisory = TuningAdvisory {
@@ -798,8 +818,12 @@ pub(crate) fn run_matrix_benchmark<W: Write>(
                 let _ = std::fs::create_dir_all(parent);
             }
         }
-        std::fs::write(export_path, json_str)
-            .map_err(|e| cap_err("io", format!("failed to write cost profile to '{export_path}': {e}")))?;
+        std::fs::write(export_path, json_str).map_err(|e| {
+            cap_err(
+                "io",
+                format!("failed to write cost profile to '{export_path}': {e}"),
+            )
+        })?;
     }
 
     let report = MatrixBenchReport {
@@ -930,7 +954,10 @@ fn write_table<W: Write>(out: &mut W, r: &MatrixBenchReport) {
             c.delta_prefill_tps, c.delta_prefill_pct, c.delta_decode_tps, c.delta_decode_pct
         );
     }
-    let _ = writeln!(out, "----------------------------------------------------------");
+    let _ = writeln!(
+        out,
+        "----------------------------------------------------------"
+    );
     let _ = writeln!(out, "Cost Profile Baseline (US-04):");
     let _ = writeln!(
         out,
@@ -950,16 +977,18 @@ fn write_table<W: Write>(out: &mut W, r: &MatrixBenchReport) {
     let _ = writeln!(
         out,
         "  Peak Resident RAM  : {} bytes (weights: {}, kv: {})",
-        r.cost_profile.peak_resident_bytes,
-        r.cost_profile.weight_bytes,
-        r.cost_profile.kv_bytes
+        r.cost_profile.peak_resident_bytes, r.cost_profile.weight_bytes, r.cost_profile.kv_bytes
     );
     let _ = writeln!(
         out,
         "  Tuning Advisory    : {} (Cluster: {}, IME: {})",
         r.cost_profile.tuning_advisory.bottleneck_classification,
         r.cost_profile.tuning_advisory.recommended_cluster,
-        if r.cost_profile.tuning_advisory.recommended_ime { "on" } else { "off" }
+        if r.cost_profile.tuning_advisory.recommended_ime {
+            "on"
+        } else {
+            "off"
+        }
     );
     let _ = writeln!(out, "{rule}");
 }

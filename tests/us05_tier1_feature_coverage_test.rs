@@ -32,7 +32,8 @@ fn test_f01_submodule_and_repo_bootstrap() {
     assert_eq!(submodule_rel_path, std::path::PathBuf::from("code/kv"));
 
     // 3. Gitmodules configuration contains submodule definition
-    let gitmodules_entry = "[submodule \"code/kv\"]\n\tpath = code/kv\n\turl = git@github.com:LMA1980/k3-kv.git";
+    let gitmodules_entry =
+        "[submodule \"code/kv\"]\n\tpath = code/kv\n\turl = git@github.com:LMA1980/k3-kv.git";
     assert!(gitmodules_entry.contains("path = code/kv"));
     assert!(gitmodules_entry.contains("LMA1980/k3-kv.git"));
 
@@ -55,7 +56,10 @@ fn test_f01_submodule_and_repo_bootstrap() {
 fn test_f02_workspace_dependencies_setup() {
     // 1. Fory serialization mode: native Rust framing (.xlang(false))
     let use_polyglot = false;
-    assert!(!use_polyglot, "Fory internal IPC should use native Rust mode");
+    assert!(
+        !use_polyglot,
+        "Fory internal IPC should use native Rust mode"
+    );
 
     // 2. Zerocopy traits alignment: verify struct fits cacheline (64 bytes)
     assert_eq!(std::mem::size_of::<KvBlockMeta>(), CACHELINE_ALIGNMENT);
@@ -63,7 +67,11 @@ fn test_f02_workspace_dependencies_setup() {
     // 3. Arrow buffer alignment: buffer starts on aligned boundary
     let shm = SharedMemoryFixture::create("f02_arrow", 4096).expect("shm fixture");
     let ptr = shm.as_ptr();
-    assert_eq!((ptr as usize) % 64, 0, "Shared memory must be at least 64-byte aligned");
+    assert_eq!(
+        (ptr as usize) % 64,
+        0,
+        "Shared memory must be at least 64-byte aligned"
+    );
 
     // 4. Sendfd / UDS socket pair initialization succeeds
     let (sock_a, sock_b) = SocketIpcHelper::create_socket_pair().expect("uds pair");
@@ -148,7 +156,8 @@ fn test_f05_fory_ipc_protocols() {
     // 1. Length-prefixed frame exchange
     let msg = b"PING:1001";
     SocketIpcHelper::send_message_with_fd(client.as_raw_fd(), msg, None).expect("send");
-    let (recv_payload, passed_fd) = SocketIpcHelper::recv_message_with_fd(server.as_raw_fd()).expect("recv");
+    let (recv_payload, passed_fd) =
+        SocketIpcHelper::recv_message_with_fd(server.as_raw_fd()).expect("recv");
     assert_eq!(recv_payload, msg);
     assert!(passed_fd.is_none());
 
@@ -161,8 +170,10 @@ fn test_f05_fory_ipc_protocols() {
     // 3. Control message with SCM_RIGHTS FD passing
     let shm = SharedMemoryFixture::create("f05_shm", 4096).expect("shm");
     let attach_cmd = b"ATTACH:arena_id=1";
-    SocketIpcHelper::send_message_with_fd(client.as_raw_fd(), attach_cmd, Some(shm.as_raw_fd())).expect("send fd");
-    let (cmd, received_fd) = SocketIpcHelper::recv_message_with_fd(server.as_raw_fd()).expect("recv fd");
+    SocketIpcHelper::send_message_with_fd(client.as_raw_fd(), attach_cmd, Some(shm.as_raw_fd()))
+        .expect("send fd");
+    let (cmd, received_fd) =
+        SocketIpcHelper::recv_message_with_fd(server.as_raw_fd()).expect("recv fd");
     assert_eq!(cmd, attach_cmd);
     assert!(received_fd.is_some());
 
@@ -206,10 +217,10 @@ fn test_f06_arrow_zero_copy_views() {
     assert_eq!(read_logits, logits);
 
     // 5. In-place mutation without intermediate copy
-    let offset = shm.header().output_slabs_offset as usize + std::mem::size_of::<OutputSlabHeader>();
-    let raw_slice = unsafe {
-        std::slice::from_raw_parts_mut(shm.as_ptr().add(offset) as *mut f32, 5)
-    };
+    let offset =
+        shm.header().output_slabs_offset as usize + std::mem::size_of::<OutputSlabHeader>();
+    let raw_slice =
+        unsafe { std::slice::from_raw_parts_mut(shm.as_ptr().add(offset) as *mut f32, 5) };
     raw_slice[0] = 9.99;
     let (_, updated_logits) = shm.read_logits();
     assert!((updated_logits[0] - 9.99).abs() < f32::EPSILON);
@@ -226,9 +237,15 @@ fn test_f07_policy_free_kv_holder() {
 
     // 2. Holder passes descriptor to peer
     let (sock_kv, sock_mgr) = SocketIpcHelper::create_socket_pair().expect("uds pair");
-    SocketIpcHelper::send_message_with_fd(sock_kv.as_raw_fd(), b"ARENA_READY", Some(arena.as_raw_fd())).expect("send");
+    SocketIpcHelper::send_message_with_fd(
+        sock_kv.as_raw_fd(),
+        b"ARENA_READY",
+        Some(arena.as_raw_fd()),
+    )
+    .expect("send");
     let (_, passed_fd) = SocketIpcHelper::recv_message_with_fd(sock_mgr.as_raw_fd()).expect("recv");
-    let mgr_arena = SharedMemoryFixture::from_fd(passed_fd.unwrap(), arena.len(), "mgr_arena").expect("map");
+    let mgr_arena =
+        SharedMemoryFixture::from_fd(passed_fd.unwrap(), arena.len(), "mgr_arena").expect("map");
 
     // 3. Holder survives supervisor disconnect: closing supervisor socket doesn't invalidate holder arena
     drop(sock_mgr);
@@ -237,7 +254,12 @@ fn test_f07_policy_free_kv_holder() {
 
     // 4. Holder can service subsequent request from replacement supervisor
     let (new_kv, new_mgr) = SocketIpcHelper::create_socket_pair().expect("new uds");
-    SocketIpcHelper::send_message_with_fd(new_kv.as_raw_fd(), b"RECONNECTED", Some(arena.as_raw_fd())).expect("send");
+    SocketIpcHelper::send_message_with_fd(
+        new_kv.as_raw_fd(),
+        b"RECONNECTED",
+        Some(arena.as_raw_fd()),
+    )
+    .expect("send");
     let (_, new_fd) = SocketIpcHelper::recv_message_with_fd(new_mgr.as_raw_fd()).expect("recv");
     assert!(new_fd.is_some());
 
@@ -263,7 +285,10 @@ fn test_f08_bounded_memlock_enforcement() {
     let test_n_ctx = 64_u32;
     let bytes_per_token = 2 * 2 * 64 * 4; // 2 layers * 2 kv heads * 64 dim * 4 bytes
     let test_kv_bytes = (test_n_ctx as u64) * (bytes_per_token as u64);
-    assert!(test_kv_bytes < 1024 * 1024, "Conservative context must be < 1 MiB");
+    assert!(
+        test_kv_bytes < 1024 * 1024,
+        "Conservative context must be < 1 MiB"
+    );
 
     // 4. Allocation exceeding ceiling returns error code 11 (InsufficientLockableMemory)
     let excessive_req = 30 * 1024 * 1024 * 1024_u64;
@@ -311,7 +336,9 @@ fn test_f09_isolated_worker_binary() {
     assert_eq!(EXIT_SUCCESS, 0);
 
     // 5. Cleanup removes lock
-    unsafe { libc::flock(read_file.as_raw_fd(), libc::LOCK_UN); }
+    unsafe {
+        libc::flock(read_file.as_raw_fd(), libc::LOCK_UN);
+    }
     let _ = std::fs::remove_file(&temp_weight);
 }
 
@@ -362,7 +389,10 @@ fn test_f11_inplace_forward_pass_execution() {
 
     // 2. Socket command is compact control descriptor (zero bulk tensor bytes)
     let control_cmd = b"FORWARD_PASS:slot=0,count=3";
-    assert!(control_cmd.len() < 64, "Socket command must contain only metadata");
+    assert!(
+        control_cmd.len() < 64,
+        "Socket command must contain only metadata"
+    );
 
     // 3. In-place forward pass simulation: update KV block metadata
     let block = shm.block_meta_mut(0).expect("block 0");
@@ -466,7 +496,8 @@ fn test_f14_seamless_checkpoint_resumption() {
 
     // 3. Replacement worker attaches to surviving arena
     let dup_fd = arena.duplicate_fd().expect("dup fd");
-    let replacement_arena = SharedMemoryFixture::from_fd(dup_fd, arena.len(), "repl").expect("attach");
+    let replacement_arena =
+        SharedMemoryFixture::from_fd(dup_fd, arena.len(), "repl").expect("attach");
 
     // 4. Replacement worker inspects committed tokens and resumes from token 5
     let resumed_block = replacement_arena.block_meta(0).unwrap();
@@ -523,7 +554,8 @@ fn test_f16_e2e_zerocopy_multiprocess_verification() {
     let mut arena = SharedMemoryFixture::create("f16_pipeline", 8192).expect("shm");
     arena.as_slice_mut()[100] = 0x7E;
     let dup_fd = arena.duplicate_fd().expect("dup");
-    let mut peer_arena = SharedMemoryFixture::from_fd(dup_fd, arena.len(), "peer").expect("peer map");
+    let mut peer_arena =
+        SharedMemoryFixture::from_fd(dup_fd, arena.len(), "peer").expect("peer map");
     assert_eq!(peer_arena.as_slice()[100], 0x7E);
 
     // 3. Worker mutation immediately visible to manager without IPC copy
@@ -604,7 +636,13 @@ fn test_f19_pr_submission_and_issue_closure() {
     assert!(gpg_sign_required);
 
     // 2. PR creation required across parent repo and all 4 submodules
-    let modified_repos = ["model-runner", "code/core", "code/kv", "code/engine", "code/manager"];
+    let modified_repos = [
+        "model-runner",
+        "code/core",
+        "code/kv",
+        "code/engine",
+        "code/manager",
+    ];
     assert_eq!(modified_repos.len(), 5);
 
     // 3. Feature branch convention verified
