@@ -64,7 +64,9 @@ impl fmt::Display for WorkerError {
         match self {
             Self::InvalidArguments(msg) => write!(f, "invalid arguments: {msg}"),
             Self::CapabilityMismatch(msg) => write!(f, "capability mismatch: {msg}"),
-            Self::InsufficientLockableMemory(msg) => write!(f, "insufficient lockable memory: {msg}"),
+            Self::InsufficientLockableMemory(msg) => {
+                write!(f, "insufficient lockable memory: {msg}")
+            }
             Self::ResourceExhausted(msg) => write!(f, "resource exhausted: {msg}"),
             Self::ProtocolError(msg) => write!(f, "protocol error: {msg}"),
             Self::Internal(msg) => write!(f, "internal error: {msg}"),

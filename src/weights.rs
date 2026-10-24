@@ -41,16 +41,7 @@ fn map_and_lock_file(fd: std::os::fd::RawFd, file_len: usize) -> Result<*mut u8,
     let map_flags = libc::MAP_PRIVATE;
 
     // SAFETY: mmap is called with valid arguments: length > 0, valid fd, PROT_READ, MAP_PRIVATE.
-    let ptr = unsafe {
-        libc::mmap(
-            ptr::null_mut(),
-            file_len,
-            libc::PROT_READ,
-            map_flags,
-            fd,
-            0,
-        )
-    };
+    let ptr = unsafe { libc::mmap(ptr::null_mut(), file_len, libc::PROT_READ, map_flags, fd, 0) };
 
     if ptr == libc::MAP_FAILED {
         return Err(K3Error::InsufficientLockableMemory {

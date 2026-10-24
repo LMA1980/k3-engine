@@ -209,15 +209,15 @@ impl MemoryInspector for SystemMemoryInspector {
                     let parts: Vec<&str> = rest.split_whitespace().collect();
                     if let Some(kb_str) = parts.first() {
                         if let Ok(kb) = kb_str.parse::<u64>() {
-                            return kb
-                                .checked_mul(1024)
-                                .ok_or(K3Error::InsufficientLockableMemory {
+                            return kb.checked_mul(1024).ok_or(
+                                K3Error::InsufficientLockableMemory {
                                     required_bytes: 0,
                                     weight_bytes: 0,
                                     kv_bytes: 0,
                                     available_bytes: 0,
                                     rlimit_memlock_bytes: 0,
-                                });
+                                },
+                            );
                         }
                     }
                 }

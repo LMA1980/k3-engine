@@ -42,7 +42,10 @@ impl LockedWeights {
         }
 
         let file = File::open(p).map_err(|err| {
-            WorkerError::ResourceExhausted(format!("failed to open model file '{}': {err}", p.display()))
+            WorkerError::ResourceExhausted(format!(
+                "failed to open model file '{}': {err}",
+                p.display()
+            ))
         })?;
 
         let fd = file.as_raw_fd();
@@ -65,7 +68,9 @@ impl LockedWeights {
             Err(e) => {
                 // SAFETY: Unlock on failure before returning.
                 unsafe { libc::flock(fd, libc::LOCK_UN) };
-                return Err(WorkerError::ResourceExhausted(format!("failed to stat model file: {e}")));
+                return Err(WorkerError::ResourceExhausted(format!(
+                    "failed to stat model file: {e}"
+                )));
             }
         };
 
@@ -112,7 +117,9 @@ impl LockedWeights {
             let last_err = std::io::Error::last_os_error();
             // SAFETY: Releasing the shared flock on mmap error.
             unsafe { libc::flock(fd, libc::LOCK_UN) };
-            return Err(WorkerError::ResourceExhausted(format!("mmap failed on model file: {last_err}")));
+            return Err(WorkerError::ResourceExhausted(format!(
+                "mmap failed on model file: {last_err}"
+            )));
         }
 
         let ptr = match NonNull::new(mmap_ptr.cast::<u8>()) {
@@ -123,7 +130,9 @@ impl LockedWeights {
                     libc::munmap(mmap_ptr, len_usize);
                     libc::flock(fd, libc::LOCK_UN);
                 }
-                return Err(WorkerError::Internal("mmap returned null pointer".to_owned()));
+                return Err(WorkerError::Internal(
+                    "mmap returned null pointer".to_owned(),
+                ));
             }
         };
 

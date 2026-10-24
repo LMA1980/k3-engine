@@ -989,50 +989,50 @@ pub fn probe_ime_on_core(core: usize) -> bool {
             if pid < 0 {
                 return false;
             }
-        if pid == 0 {
-            if core >= 8 {
-                let tid = libc::syscall(libc::SYS_gettid);
-                let path = b"/proc/set_ai_thread\0";
-                let fd = libc::open(path.as_ptr().cast::<libc::c_char>(), libc::O_WRONLY);
-                if fd >= 0 {
-                    let mut buf = [0_u8; 32];
-                    let mut tmp = [0_u8; 32];
-                    let mut val = tid;
-                    let mut i = 0_usize;
-                    if val <= 0 {
-                        buf[0] = b'0';
-                        i = 1;
-                    } else {
-                        while val > 0 {
-                            tmp[i] = b'0' + (val % 10) as u8;
-                            val /= 10;
-                            i += 1;
+            if pid == 0 {
+                if core >= 8 {
+                    let tid = libc::syscall(libc::SYS_gettid);
+                    let path = b"/proc/set_ai_thread\0";
+                    let fd = libc::open(path.as_ptr().cast::<libc::c_char>(), libc::O_WRONLY);
+                    if fd >= 0 {
+                        let mut buf = [0_u8; 32];
+                        let mut tmp = [0_u8; 32];
+                        let mut val = tid;
+                        let mut i = 0_usize;
+                        if val <= 0 {
+                            buf[0] = b'0';
+                            i = 1;
+                        } else {
+                            while val > 0 {
+                                tmp[i] = b'0' + (val % 10) as u8;
+                                val /= 10;
+                                i += 1;
+                            }
+                            for j in 0..i {
+                                buf[j] = tmp[i - 1 - j];
+                            }
                         }
-                        for j in 0..i {
-                            buf[j] = tmp[i - 1 - j];
-                        }
+                        buf[i] = b'\n';
+                        let _ = libc::write(fd, buf.as_ptr().cast::<libc::c_void>(), i + 1);
+                        libc::close(fd);
                     }
-                    buf[i] = b'\n';
-                    let _ = libc::write(fd, buf.as_ptr().cast::<libc::c_void>(), i + 1);
-                    libc::close(fd);
                 }
+                let r = libc::syscall(
+                    libc::SYS_sched_setaffinity,
+                    0_i32,
+                    size_of::<u64>(),
+                    std::ptr::from_ref(&mask).cast::<libc::c_void>(),
+                );
+                if r < 0 {
+                    libc::_exit(2);
+                }
+                libc::_exit(if ime_probe_exec() { 0 } else { 3 });
             }
-            let r = libc::syscall(
-                libc::SYS_sched_setaffinity,
-                0_i32,
-                size_of::<u64>(),
-                std::ptr::from_ref(&mask).cast::<libc::c_void>(),
-            );
-            if r < 0 {
-                libc::_exit(2);
+            let mut status = 0_i32;
+            if libc::waitpid(pid, &raw mut status, 0) < 0 {
+                return false;
             }
-            libc::_exit(if ime_probe_exec() { 0 } else { 3 });
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
         }
-        let mut status = 0_i32;
-        if libc::waitpid(pid, &raw mut status, 0) < 0 {
-            return false;
-        }
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
-    }
     }
 }

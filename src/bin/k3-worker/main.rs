@@ -16,11 +16,11 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use k3_engine::worker::affinity::{parse_affinity_spec, pin_worker_core, verify_cluster_capabilities};
-use k3_engine::worker::cli::WorkerConfig;
-use k3_engine::worker::error::{
-    EXIT_INVALID_ARGS, EXIT_PROTOCOL_ERROR,
+use k3_engine::worker::affinity::{
+    parse_affinity_spec, pin_worker_core, verify_cluster_capabilities,
 };
+use k3_engine::worker::cli::WorkerConfig;
+use k3_engine::worker::error::{EXIT_INVALID_ARGS, EXIT_PROTOCOL_ERROR};
 use k3_engine::worker::weights::LockedWeights;
 use k3_engine::worker::worker::WorkerEngine;
 
@@ -103,7 +103,10 @@ async fn main() -> ExitCode {
             let listener = match UnixListener::bind(path) {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!("[k3-worker error] failed to bind socket {}: {e}", path.display());
+                    eprintln!(
+                        "[k3-worker error] failed to bind socket {}: {e}",
+                        path.display()
+                    );
                     return ExitCode::from(EXIT_PROTOCOL_ERROR as u8);
                 }
             };
@@ -146,12 +149,18 @@ async fn main() -> ExitCode {
                         match listener.accept() {
                             Ok((s, _)) => s,
                             Err(e) => {
-                                eprintln!("[k3-worker error] accept failed on {}: {e}", path.display());
+                                eprintln!(
+                                    "[k3-worker error] accept failed on {}: {e}",
+                                    path.display()
+                                );
                                 return ExitCode::from(EXIT_PROTOCOL_ERROR as u8);
                             }
                         }
                     } else {
-                        eprintln!("[k3-worker error] failed to connect to socket {}", path.display());
+                        eprintln!(
+                            "[k3-worker error] failed to connect to socket {}",
+                            path.display()
+                        );
                         return ExitCode::from(EXIT_PROTOCOL_ERROR as u8);
                     }
                 }
@@ -162,7 +171,8 @@ async fn main() -> ExitCode {
     };
 
     // 5. Register OS signal handlers for graceful shutdown (exit code 0)
-    let mut sigint = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+    let mut sigint = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+    {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[k3-worker error] failed to register SIGINT handler: {e}");
@@ -170,7 +180,8 @@ async fn main() -> ExitCode {
         }
     };
 
-    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[k3-worker error] failed to register SIGTERM handler: {e}");

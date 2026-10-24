@@ -125,7 +125,12 @@ fn test_b04_socket_error_handling_and_disconnections() {
     let raw_a = sock_a.as_raw_fd();
     let partial_bytes = [0x00, 0x00];
     unsafe {
-        libc::send(raw_a, partial_bytes.as_ptr() as *const libc::c_void, partial_bytes.len(), 0);
+        libc::send(
+            raw_a,
+            partial_bytes.as_ptr() as *const libc::c_void,
+            partial_bytes.len(),
+            0,
+        );
     }
     drop(sock_a); // abrupt close
 
@@ -143,8 +148,10 @@ fn test_b04_socket_error_handling_and_disconnections() {
     // 4. Large message payload boundary (64 KiB control frame)
     let (client, server) = SocketIpcHelper::create_socket_pair().expect("pair");
     let large_payload = vec![0x42_u8; 64 * 1024];
-    SocketIpcHelper::send_message_with_fd(client.as_raw_fd(), &large_payload, None).expect("send large");
-    let (received, _) = SocketIpcHelper::recv_message_with_fd(server.as_raw_fd()).expect("recv large");
+    SocketIpcHelper::send_message_with_fd(client.as_raw_fd(), &large_payload, None)
+        .expect("send large");
+    let (received, _) =
+        SocketIpcHelper::recv_message_with_fd(server.as_raw_fd()).expect("recv large");
     assert_eq!(received.len(), 64 * 1024);
     assert_eq!(received[0], 0x42);
 
@@ -173,17 +180,26 @@ fn test_b05_malformed_shm_frames_and_magic() {
     arena.header_mut().version = ARENA_VERSION;
     arena.header_mut().meta_table_offset = 1_000_000;
     let block = arena.block_meta(0);
-    assert!(block.is_none(), "Out of bounds block table offset must return None");
+    assert!(
+        block.is_none(),
+        "Out of bounds block table offset must return None"
+    );
 
     // 4. Corrupted token_slots_offset causing token write rejection
     arena.header_mut().token_slots_offset = 1_000_000;
     let write_res = arena.write_tokens(&[1, 2, 3]);
-    assert!(write_res.is_err(), "Token write exceeding arena bounds must fail");
+    assert!(
+        write_res.is_err(),
+        "Token write exceeding arena bounds must fail"
+    );
 
     // 5. Corrupted output_slabs_offset causing logit write rejection
     arena.header_mut().output_slabs_offset = 1_000_000;
     let logit_res = arena.write_logits(1, &[0.5, 1.5]);
-    assert!(logit_res.is_err(), "Logit write exceeding arena bounds must fail");
+    assert!(
+        logit_res.is_err(),
+        "Logit write exceeding arena bounds must fail"
+    );
 }
 
 // ============================================================================
@@ -195,24 +211,32 @@ fn test_b06_scm_rights_edge_conditions() {
 
     // 1. Passing invalid file descriptor (-1) must fail or return error
     let invalid_fd = -1_i32;
-    let send_invalid = SocketIpcHelper::send_message_with_fd(sock_a.as_raw_fd(), b"TEST_INVALID_FD", Some(invalid_fd));
+    let send_invalid = SocketIpcHelper::send_message_with_fd(
+        sock_a.as_raw_fd(),
+        b"TEST_INVALID_FD",
+        Some(invalid_fd),
+    );
     assert!(send_invalid.is_err(), "Passing invalid RawFd must fail");
 
     // 2. Message sent without FD carries payload cleanly
     SocketIpcHelper::send_message_with_fd(sock_a.as_raw_fd(), b"NO_FD", None).expect("send no fd");
-    let (payload, received_fd) = SocketIpcHelper::recv_message_with_fd(sock_b.as_raw_fd()).expect("recv no fd");
+    let (payload, received_fd) =
+        SocketIpcHelper::recv_message_with_fd(sock_b.as_raw_fd()).expect("recv no fd");
     assert_eq!(payload, b"NO_FD");
     assert!(received_fd.is_none());
 
     // 3. Message sent with valid FD transfers descriptor cleanly
     let shm = SharedMemoryFixture::create("b06_valid", 4096).expect("shm");
-    SocketIpcHelper::send_message_with_fd(sock_a.as_raw_fd(), b"WITH_FD", Some(shm.as_raw_fd())).expect("send with fd");
-    let (p2, rec_fd) = SocketIpcHelper::recv_message_with_fd(sock_b.as_raw_fd()).expect("recv with fd");
+    SocketIpcHelper::send_message_with_fd(sock_a.as_raw_fd(), b"WITH_FD", Some(shm.as_raw_fd()))
+        .expect("send with fd");
+    let (p2, rec_fd) =
+        SocketIpcHelper::recv_message_with_fd(sock_b.as_raw_fd()).expect("recv with fd");
     assert_eq!(p2, b"WITH_FD");
     assert!(rec_fd.is_some());
 
     // 4. Closing the sender's FD does not invalidate receiver's mapped copy
-    let mut mapped_receiver = SharedMemoryFixture::from_fd(rec_fd.unwrap(), 4096, "receiver_map").expect("map");
+    let mut mapped_receiver =
+        SharedMemoryFixture::from_fd(rec_fd.unwrap(), 4096, "receiver_map").expect("map");
     drop(shm); // sender closes original descriptor
     mapped_receiver.as_slice_mut()[0] = 0x55;
     assert_eq!(mapped_receiver.as_slice()[0], 0x55);
@@ -243,19 +267,34 @@ fn test_b07_advisory_file_locking_conflicts() {
     // 3. Garbage collector attempting LOCK_EX is refused immediately (LOCK_NB)
     let gc_probe = File::open(&temp_file).expect("open gc");
     let gc_ret = unsafe { libc::flock(gc_probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    assert_ne!(gc_ret, 0, "Exclusive lock must be refused while LOCK_SH is held");
+    assert_ne!(
+        gc_ret, 0,
+        "Exclusive lock must be refused while LOCK_SH is held"
+    );
 
     // 4. Releasing reader1 still leaves LOCK_SH held by reader2
-    unsafe { libc::flock(reader1.as_raw_fd(), libc::LOCK_UN); }
+    unsafe {
+        libc::flock(reader1.as_raw_fd(), libc::LOCK_UN);
+    }
     let gc_ret2 = unsafe { libc::flock(gc_probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    assert_ne!(gc_ret2, 0, "Exclusive lock still refused while Worker 2 holds LOCK_SH");
+    assert_ne!(
+        gc_ret2, 0,
+        "Exclusive lock still refused while Worker 2 holds LOCK_SH"
+    );
 
     // 5. Releasing reader2 allows GC to acquire LOCK_EX
-    unsafe { libc::flock(reader2.as_raw_fd(), libc::LOCK_UN); }
+    unsafe {
+        libc::flock(reader2.as_raw_fd(), libc::LOCK_UN);
+    }
     let gc_ret3 = unsafe { libc::flock(gc_probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    assert_eq!(gc_ret3, 0, "GC can now acquire LOCK_EX once all shared locks are released");
+    assert_eq!(
+        gc_ret3, 0,
+        "GC can now acquire LOCK_EX once all shared locks are released"
+    );
 
-    unsafe { libc::flock(gc_probe.as_raw_fd(), libc::LOCK_UN); }
+    unsafe {
+        libc::flock(gc_probe.as_raw_fd(), libc::LOCK_UN);
+    }
     let _ = std::fs::remove_file(&temp_file);
 }
 

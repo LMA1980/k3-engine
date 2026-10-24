@@ -13,13 +13,13 @@ use std::os::unix::net::UnixStream;
 use std::thread;
 
 use k3_core::ipc::layout::{
-    ArenaHeader, KvBlockTag, OutputSlabHeader, TokenInputSlotHeader, ARENA_MAGIC,
-    ARENA_VERSION, SLAB_STATUS_WRITTEN,
+    ARENA_MAGIC, ARENA_VERSION, ArenaHeader, KvBlockTag, OutputSlabHeader, SLAB_STATUS_WRITTEN,
+    TokenInputSlotHeader,
 };
 use k3_core::ipc::protocol::{
-    create_uds_socket_pair, global_fory, recv_frame, recv_msg_frame, send_frame, send_msg_frame,
-    AttachArenaCommand, ForwardPassCommand, IpcMessage, StatusCode, WorkerHeartbeatRequest,
-    ShutdownCommand,
+    AttachArenaCommand, ForwardPassCommand, IpcMessage, ShutdownCommand, StatusCode,
+    WorkerHeartbeatRequest, create_uds_socket_pair, global_fory, recv_frame, recv_msg_frame,
+    send_frame, send_msg_frame,
 };
 use k3_core::ipc::shm::SharedMemoryArena;
 use k3_engine::worker::cli::WorkerConfig;
@@ -38,7 +38,8 @@ fn test_e2e_worker_engine_socket_loop_and_zerocopy_dispatch() {
 
     // 2. Prepare shared memory arena
     let arena_size = 32768_usize;
-    let mut arena = SharedMemoryArena::create("e2e_engine_arena", arena_size).expect("create arena");
+    let mut arena =
+        SharedMemoryArena::create("e2e_engine_arena", arena_size).expect("create arena");
 
     // Initialize ArenaHeader at offset 0
     let header = ArenaHeader {
@@ -81,9 +82,7 @@ fn test_e2e_worker_engine_socket_loop_and_zerocopy_dispatch() {
     let weights = LockedWeights::open(&model_path).expect("open weights");
     let mut engine = WorkerEngine::new(config, weights);
 
-    let worker_handle = thread::spawn(move || {
-        engine.run_event_loop(worker_sock)
-    });
+    let worker_handle = thread::spawn(move || engine.run_event_loop(worker_sock));
 
     // 5. Manager sends AttachArenaCommand (Type ID 201) with attached arena FD
     let dup_fd = arena.duplicate_fd().expect("dup arena fd");
@@ -97,13 +96,24 @@ fn test_e2e_worker_engine_socket_loop_and_zerocopy_dispatch() {
         .serialize(global_fory())
         .unwrap();
 
-    send_frame(mgr_sock.as_raw_fd(), cmd_type, &payload, Some(dup_fd.as_raw_fd()))
-        .expect("send AttachArenaCommand with FD");
+    send_frame(
+        mgr_sock.as_raw_fd(),
+        cmd_type,
+        &payload,
+        Some(dup_fd.as_raw_fd()),
+    )
+    .expect("send AttachArenaCommand with FD");
 
     // Manager receives AttachArenaResponse (Type ID 206, StatusCode::Success)
-    let (resp_hdr, resp_payload, _) = recv_frame(mgr_sock.as_raw_fd()).expect("recv AttachArena response");
+    let (resp_hdr, resp_payload, _) =
+        recv_frame(mgr_sock.as_raw_fd()).expect("recv AttachArena response");
     assert_eq!(resp_hdr.type_id, 206);
-    let status_val = u32::from_le_bytes([resp_payload[0], resp_payload[1], resp_payload[2], resp_payload[3]]);
+    let status_val = u32::from_le_bytes([
+        resp_payload[0],
+        resp_payload[1],
+        resp_payload[2],
+        resp_payload[3],
+    ]);
     assert_eq!(status_val, StatusCode::Success as u32);
 
     // 6. Manager writes prompt tokens directly into shared memory TokenInputSlot
@@ -118,7 +128,9 @@ fn test_e2e_worker_engine_socket_loop_and_zerocopy_dispatch() {
     let slot_hdr_slice = arena.slice_mut(slot_offset, 16).unwrap();
     slot_hdr_slice.copy_from_slice(slot_hdr.as_bytes());
 
-    let tokens_slice = arena.slice_mut(slot_offset + 16, prompt_tokens.len() * 4).unwrap();
+    let tokens_slice = arena
+        .slice_mut(slot_offset + 16, prompt_tokens.len() * 4)
+        .unwrap();
     for (i, &t) in prompt_tokens.iter().enumerate() {
         tokens_slice[i * 4..(i + 1) * 4].copy_from_slice(&t.to_ne_bytes());
     }
@@ -144,7 +156,8 @@ fn test_e2e_worker_engine_socket_loop_and_zerocopy_dispatch() {
         12 + fwd_payload.len()
     );
 
-    send_frame(mgr_sock.as_raw_fd(), fwd_type, &fwd_payload, None).expect("send ForwardPassCommand");
+    send_frame(mgr_sock.as_raw_fd(), fwd_type, &fwd_payload, None)
+        .expect("send ForwardPassCommand");
 
     // 8. Manager receives ForwardPassCompleted (Type ID 203) over UDS
     let (completed_msg, _) = recv_msg_frame(&mgr_sock).expect("recv ForwardPassCompleted");
@@ -193,7 +206,10 @@ fn test_e2e_worker_engine_socket_loop_and_zerocopy_dispatch() {
             logits_slice[i * 4 + 3],
         ]);
     }
-    assert_eq!(read_logits, expected_logits, "Logits must match reference computation bit-for-bit");
+    assert_eq!(
+        read_logits, expected_logits,
+        "Logits must match reference computation bit-for-bit"
+    );
 
     // 10. Test WorkerHeartbeatRequest -> WorkerHeartbeatResponse
     let hb_req = IpcMessage::WorkerHeartbeatRequest(WorkerHeartbeatRequest {
@@ -216,7 +232,10 @@ fn test_e2e_worker_engine_socket_loop_and_zerocopy_dispatch() {
     send_msg_frame(&mgr_sock, &shutdown_cmd, None).expect("send shutdown command");
 
     let thread_res = worker_handle.join().expect("join worker thread");
-    assert!(thread_res.is_ok(), "Worker engine must exit cleanly with Ok(())");
+    assert!(
+        thread_res.is_ok(),
+        "Worker engine must exit cleanly with Ok(())"
+    );
 
     let _ = std::fs::remove_file(&model_path);
 }
@@ -272,7 +291,11 @@ fn test_e2e_worker_subprocess_lifecycle_and_shutdown() {
     send_msg_frame(&stream, &shutdown_cmd, None).expect("send ShutdownCommand to child");
 
     let exit_status = child.wait().expect("wait for child process");
-    assert_eq!(exit_status.code(), Some(0), "Child worker must exit cleanly with code 0");
+    assert_eq!(
+        exit_status.code(),
+        Some(0),
+        "Child worker must exit cleanly with code 0"
+    );
 
     let _ = std::fs::remove_file(&model_path);
     let _ = std::fs::remove_file(&socket_path);

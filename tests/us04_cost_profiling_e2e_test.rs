@@ -34,8 +34,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use k3_core::{CostProfile, QuantType};
 use k3_core::test_helpers::create_synthetic_gguf_v3;
+use k3_core::{CostProfile, QuantType};
 use serde_json::Value;
 
 static RAND_SEED: AtomicU64 = AtomicU64::new(100);
@@ -52,10 +52,13 @@ struct TempModelFixture {
 #[allow(dead_code)]
 impl TempModelFixture {
     fn new(tag: &str) -> Self {
-        Self::with_specs(tag, &[
-            ("blk.0.attn_q.weight", QuantType::Q4_K_M, &[256, 2][..]),
-            ("output_norm.weight", QuantType::F32, &[16][..]),
-        ])
+        Self::with_specs(
+            tag,
+            &[
+                ("blk.0.attn_q.weight", QuantType::Q4_K_M, &[256, 2][..]),
+                ("output_norm.weight", QuantType::F32, &[16][..]),
+            ],
+        )
     }
 
     fn with_specs(tag: &str, specs: &[(&str, QuantType, &[usize])]) -> Self {
@@ -130,29 +133,56 @@ fn test_us04_s1_single_cluster_x100_ceiling_reporting() {
 
     // R1: Prefill efficiency
     let prefill_tps = val["prefill_tps"].as_f64().expect("prefill_tps as f64");
-    let prefill_ms = val["prefill_latency_ms"].as_f64().expect("prefill_latency_ms as f64");
-    let prefill_cost_per_tok = val["prefill_cost_per_token_ms"].as_f64().expect("prefill_cost_per_token_ms as f64");
-    let prefill_ceiling = val["prefill_hardware_ceiling_pct"].as_f64().expect("prefill_hardware_ceiling_pct as f64");
+    let prefill_ms = val["prefill_latency_ms"]
+        .as_f64()
+        .expect("prefill_latency_ms as f64");
+    let prefill_cost_per_tok = val["prefill_cost_per_token_ms"]
+        .as_f64()
+        .expect("prefill_cost_per_token_ms as f64");
+    let prefill_ceiling = val["prefill_hardware_ceiling_pct"]
+        .as_f64()
+        .expect("prefill_hardware_ceiling_pct as f64");
 
     assert!(prefill_tps > 0.0, "prefill throughput must be positive");
     assert!(prefill_ms > 0.0, "prefill latency must be positive");
-    assert!(prefill_cost_per_tok > 0.0, "prefill cost per token must be positive");
-    assert!(prefill_ceiling >= 0.0, "prefill ceiling pct must be non-negative");
+    assert!(
+        prefill_cost_per_tok > 0.0,
+        "prefill cost per token must be positive"
+    );
+    assert!(
+        prefill_ceiling >= 0.0,
+        "prefill ceiling pct must be non-negative"
+    );
 
     // R1: Decode efficiency
     let decode_tps = val["decode_tps"].as_f64().expect("decode_tps as f64");
-    let decode_ms = val["decode_latency_ms"].as_f64().expect("decode_latency_ms as f64");
-    let decode_cost_per_tok = val["decode_cost_per_token_ms"].as_f64().expect("decode_cost_per_token_ms as f64");
-    let decode_ceiling = val["decode_hardware_ceiling_pct"].as_f64().expect("decode_hardware_ceiling_pct as f64");
+    let decode_ms = val["decode_latency_ms"]
+        .as_f64()
+        .expect("decode_latency_ms as f64");
+    let decode_cost_per_tok = val["decode_cost_per_token_ms"]
+        .as_f64()
+        .expect("decode_cost_per_token_ms as f64");
+    let decode_ceiling = val["decode_hardware_ceiling_pct"]
+        .as_f64()
+        .expect("decode_hardware_ceiling_pct as f64");
 
     assert!(decode_tps > 0.0, "decode throughput must be positive");
     assert!(decode_ms > 0.0, "decode latency must be positive");
-    assert!(decode_cost_per_tok > 0.0, "decode cost per token must be positive");
-    assert!(decode_ceiling >= 0.0, "decode ceiling pct must be non-negative");
+    assert!(
+        decode_cost_per_tok > 0.0,
+        "decode cost per token must be positive"
+    );
+    assert!(
+        decode_ceiling >= 0.0,
+        "decode ceiling pct must be non-negative"
+    );
 
     // PhaseReport structured verification
     assert_eq!(val["prefill"]["ceiling_metric"].as_str(), Some("peak_macs"));
-    assert_eq!(val["decode"]["ceiling_metric"].as_str(), Some("memory_bandwidth"));
+    assert_eq!(
+        val["decode"]["ceiling_metric"].as_str(),
+        Some("memory_bandwidth")
+    );
 }
 
 #[test]
@@ -188,7 +218,11 @@ fn test_us04_s1_single_cluster_a100_ceiling_reporting() {
     assert!(out_on.status.success());
     assert!(val_on["prefill_hardware_ceiling_pct"].as_f64().unwrap() >= 0.0);
     assert!(val_on["decode_hardware_ceiling_pct"].as_f64().unwrap() >= 0.0);
-    assert!(val_on["cost_profile"]["tuning_advisory"]["recommended_ime"].as_bool().unwrap());
+    assert!(
+        val_on["cost_profile"]["tuning_advisory"]["recommended_ime"]
+            .as_bool()
+            .unwrap()
+    );
 }
 
 #[test]
@@ -233,10 +267,22 @@ fn test_us04_s1_human_readable_table_format() {
     assert!(stdout.contains("Prefill"), "must contain Prefill row");
     assert!(stdout.contains("Decode"), "must contain Decode row");
     assert!(stdout.contains("ms/token"), "must display cost in ms/token");
-    assert!(stdout.contains("% of peak_macs ceiling"), "must display compute ceiling ratio");
-    assert!(stdout.contains("% of memory_bandwidth ceiling"), "must display bandwidth ceiling ratio");
-    assert!(stdout.contains("Cost Profile Baseline (US-04):"), "must display baseline header");
-    assert!(stdout.contains("Tuning Advisory"), "must display tuning advisory");
+    assert!(
+        stdout.contains("% of peak_macs ceiling"),
+        "must display compute ceiling ratio"
+    );
+    assert!(
+        stdout.contains("% of memory_bandwidth ceiling"),
+        "must display bandwidth ceiling ratio"
+    );
+    assert!(
+        stdout.contains("Cost Profile Baseline (US-04):"),
+        "must display baseline header"
+    );
+    assert!(
+        stdout.contains("Tuning Advisory"),
+        "must display tuning advisory"
+    );
 
     // Dual-cluster table summary
     let (out2, stdout2, _stderr) = run_diag(&[
@@ -271,8 +317,18 @@ fn test_us04_s1_multi_repeat_benchmark() {
     assert!(out.status.success());
     assert_eq!(val["repeat_count"].as_u64(), Some(3));
     assert_eq!(val["determinism_verified"].as_bool(), Some(true));
-    assert!(val["cost_profile"]["prefill_cost_per_token_ms"].as_f64().unwrap() > 0.0);
-    assert!(val["cost_profile"]["decode_cost_per_token_ms"].as_f64().unwrap() > 0.0);
+    assert!(
+        val["cost_profile"]["prefill_cost_per_token_ms"]
+            .as_f64()
+            .unwrap()
+            > 0.0
+    );
+    assert!(
+        val["cost_profile"]["decode_cost_per_token_ms"]
+            .as_f64()
+            .unwrap()
+            > 0.0
+    );
 }
 
 #[test]
@@ -313,16 +369,25 @@ fn test_us04_s2_json_contains_valid_cost_profile_schema() {
     assert!(out.status.success());
 
     let cp_val = &val["cost_profile"];
-    assert!(cp_val.is_object(), "cost_profile must be a structured JSON object");
+    assert!(
+        cp_val.is_object(),
+        "cost_profile must be a structured JSON object"
+    );
 
     // Deserialize into typed CostProfile
     let cp: CostProfile = serde_json::from_value(cp_val.clone()).expect("parse CostProfile schema");
 
     // 1. Model identity
-    assert!(!cp.model_identity.name.is_empty(), "model name must not be empty");
+    assert!(
+        !cp.model_identity.name.is_empty(),
+        "model name must not be empty"
+    );
     assert_eq!(cp.model_identity.architecture, "synthetic");
     assert_eq!(cp.model_identity.file_path, fixture.path_str());
-    assert!(!cp.model_identity.file_digest.is_empty(), "digest must not be empty");
+    assert!(
+        !cp.model_identity.file_digest.is_empty(),
+        "digest must not be empty"
+    );
 
     // 2. Quantization level
     assert_eq!(cp.quantization_level.primary, "Q4_K_M");
@@ -383,7 +448,11 @@ fn test_us04_s2_json_contains_valid_cost_profile_schema() {
     );
     assert!(!cp.tuning_advisory.recommended_cluster.is_empty());
     assert!(!cp.tuning_advisory.recommendations.is_empty());
-    assert!(cp.tuning_advisory.operator_authority_notice.contains("ADR-032"));
+    assert!(
+        cp.tuning_advisory
+            .operator_authority_notice
+            .contains("ADR-032")
+    );
 }
 
 #[test]
@@ -407,7 +476,10 @@ fn test_us04_s2_export_profile_file_generation() {
     ]);
 
     assert!(out.status.success());
-    assert!(export_path.exists(), "exported profile JSON file must exist");
+    assert!(
+        export_path.exists(),
+        "exported profile JSON file must exist"
+    );
 
     // Stdout was table format because --json was not passed
     assert!(stdout.contains("Cost Profile Baseline (US-04):"));
@@ -559,8 +631,14 @@ fn test_us04_s2_memory_footprint_invariants() {
     );
     assert_eq!(cp.memory_footprint.weight_bytes, cp.weight_bytes);
     assert_eq!(cp.memory_footprint.kv_bytes, cp.kv_bytes);
-    assert_eq!(cp.memory_footprint.total_required_bytes, cp.total_required_bytes);
-    assert_eq!(cp.memory_footprint.peak_resident_bytes, cp.peak_resident_bytes);
+    assert_eq!(
+        cp.memory_footprint.total_required_bytes,
+        cp.total_required_bytes
+    );
+    assert_eq!(
+        cp.memory_footprint.peak_resident_bytes,
+        cp.peak_resident_bytes
+    );
 }
 
 #[test]
@@ -659,12 +737,7 @@ fn test_us04_error_capability_mismatch_ime_on_x100() {
 #[test]
 fn test_us04_error_cluster_both_without_split() {
     let fixture = TempModelFixture::new("err_both_no_split");
-    let (out, _stdout, stderr) = run_diag(&[
-        "--model",
-        fixture.path_str(),
-        "--cluster",
-        "both",
-    ]);
+    let (out, _stdout, stderr) = run_diag(&["--model", fixture.path_str(), "--cluster", "both"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(stderr.contains("--cluster both requires an explicit --split"));
 }
@@ -706,7 +779,11 @@ fn test_us04_error_empty_export_profile_argument() {
 #[test]
 fn test_us04_s2_export_profile_nested_directory_creation() {
     let fixture = TempModelFixture::new("s2_nested");
-    let unique_dir = std::env::temp_dir().join(format!("k3_nested_test_{}_{}", std::process::id(), fastrand()));
+    let unique_dir = std::env::temp_dir().join(format!(
+        "k3_nested_test_{}_{}",
+        std::process::id(),
+        fastrand()
+    ));
     let export_path = unique_dir.join("sub").join("nested_profile.json");
 
     assert!(!unique_dir.exists());
@@ -723,7 +800,10 @@ fn test_us04_s2_export_profile_nested_directory_creation() {
     ]);
 
     assert!(out.status.success());
-    assert!(export_path.exists(), "nested exported profile JSON must exist");
+    assert!(
+        export_path.exists(),
+        "nested exported profile JSON must exist"
+    );
 
     let file_content = std::fs::read_to_string(&export_path).expect("read nested file");
     let profile: CostProfile = serde_json::from_str(&file_content).expect("parse nested JSON");
@@ -761,4 +841,3 @@ fn test_us04_s2_export_profile_default_cluster() {
 
     let _ = std::fs::remove_file(&export_path);
 }
-

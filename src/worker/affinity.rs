@@ -20,28 +20,36 @@ pub const A100_CLUSTER_MASK: u64 = 0xFF00;
 pub fn parse_affinity_spec(spec: &str) -> Result<(usize, u64), WorkerError> {
     let s = spec.trim();
     if s.is_empty() {
-        return Err(WorkerError::InvalidArguments("affinity spec cannot be empty".to_owned()));
+        return Err(WorkerError::InvalidArguments(
+            "affinity spec cannot be empty".to_owned(),
+        ));
     }
 
     // Try parsing as single core number first (e.g. "8")
     if let Ok(core) = s.parse::<usize>() {
         if core >= 64 {
-            return Err(WorkerError::InvalidArguments(format!("core index {core} exceeds 63")));
+            return Err(WorkerError::InvalidArguments(format!(
+                "core index {core} exceeds 63"
+            )));
         }
         return Ok((core, 1_u64 << core));
     }
 
     // Try parsing as hex bitmask (e.g. "0xFF00" or "0x00FF")
     let mask = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        u64::from_str_radix(hex, 16)
-            .map_err(|e| WorkerError::InvalidArguments(format!("invalid hex affinity mask '{s}': {e}")))?
+        u64::from_str_radix(hex, 16).map_err(|e| {
+            WorkerError::InvalidArguments(format!("invalid hex affinity mask '{s}': {e}"))
+        })?
     } else {
-        s.parse::<u64>()
-            .map_err(|e| WorkerError::InvalidArguments(format!("invalid affinity mask '{s}': {e}")))?
+        s.parse::<u64>().map_err(|e| {
+            WorkerError::InvalidArguments(format!("invalid affinity mask '{s}': {e}"))
+        })?
     };
 
     if mask == 0 {
-        return Err(WorkerError::InvalidArguments("affinity mask cannot be 0".to_owned()));
+        return Err(WorkerError::InvalidArguments(
+            "affinity mask cannot be 0".to_owned(),
+        ));
     }
 
     // Lowest set bit represents the primary core
@@ -110,7 +118,8 @@ pub fn verify_cluster_capabilities_with_sim(
 
         if !is_a100_present {
             return Err(WorkerError::CapabilityMismatch(
-                "host does not possess physical SpacemiT K3 A100 compute cores (cpu8-15)".to_owned(),
+                "host does not possess physical SpacemiT K3 A100 compute cores (cpu8-15)"
+                    .to_owned(),
             ));
         }
 
