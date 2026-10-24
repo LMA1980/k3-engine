@@ -3,7 +3,7 @@
 use std::os::fd::RawFd;
 use std::path::PathBuf;
 
-use crate::error::WorkerError;
+use super::error::WorkerError;
 
 /// Configuration parsed from command-line arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]

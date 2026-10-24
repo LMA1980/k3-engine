@@ -5,7 +5,7 @@ use core::mem::size_of;
 #[cfg(target_arch = "riscv64")]
 use std::path::Path;
 
-use crate::error::WorkerError;
+use super::error::WorkerError;
 
 /// Core bitmask for Cluster 0 (X100 Out-of-Order cores 0–7, VLEN = 256 bits).
 pub const X100_CLUSTER_MASK: u64 = 0x00FF;

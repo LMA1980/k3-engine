@@ -17,9 +17,9 @@ use k3_core::ipc::protocol::{
 use k3_core::ipc::shm::SharedMemoryArena;
 use zerocopy::FromBytes;
 
-use crate::cli::WorkerConfig;
-use crate::error::WorkerError;
-use crate::weights::LockedWeights;
+use super::cli::WorkerConfig;
+use super::error::WorkerError;
+use super::weights::LockedWeights;
 
 /// Isolated compute worker execution engine.
 #[derive(Debug)]
