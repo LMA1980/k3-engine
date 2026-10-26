@@ -393,6 +393,7 @@ mod tests {
     #[test]
     fn test_capability_check_a100_simulated() {
         assert!(verify_cluster_capabilities_with_sim("a100", None, Some("1")).is_ok());
-        assert!(verify_cluster_capabilities_with_sim("x100", Some("8"), Some("1")).is_ok());
+        assert!(verify_cluster_capabilities_with_sim("a100", Some("8"), Some("1")).is_ok());
+        assert!(verify_cluster_capabilities_with_sim("x100", Some("8"), Some("1")).is_err());
     }
 }

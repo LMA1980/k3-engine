@@ -525,6 +525,74 @@ fn test_cli_non_contiguous_and_cross_cluster_rejections() {
         .expect("run k3-worker x100 with A100 cores");
     assert_eq!(output_x100_a100.status.code(), Some(10));
 
+    // --cluster a100 with --affinity 8-9 and --threads 3 (exceeds 2 available cores) -> exit code 10
+    let output_a100_sub3 = Command::new(BIN_PATH)
+        .env("K3_SIMULATE_A100", "1")
+        .args([
+            "--model",
+            model_path.to_str().unwrap(),
+            "--socket",
+            "/tmp/fake.sock",
+            "--cluster",
+            "a100",
+            "--affinity",
+            "8-9",
+            "--threads",
+            "3",
+        ])
+        .output()
+        .expect("run k3-worker a100 with threads 3 on 2 cores");
+    assert_eq!(output_a100_sub3.status.code(), Some(10));
+
+    // --cluster x100 with --threads 7 (exceeds 6-thread compute cap) -> exit code 10
+    let output_x100_t7 = Command::new(BIN_PATH)
+        .args([
+            "--model",
+            model_path.to_str().unwrap(),
+            "--socket",
+            "/tmp/fake.sock",
+            "--cluster",
+            "x100",
+            "--threads",
+            "7",
+        ])
+        .output()
+        .expect("run k3-worker x100 with 7 threads");
+    assert_eq!(output_x100_t7.status.code(), Some(10));
+
+    // --cluster a100 with --threads 9 (exceeds 8-thread compute cap) -> exit code 10
+    let output_a100_t9 = Command::new(BIN_PATH)
+        .env("K3_SIMULATE_A100", "1")
+        .args([
+            "--model",
+            model_path.to_str().unwrap(),
+            "--socket",
+            "/tmp/fake.sock",
+            "--cluster",
+            "a100",
+            "--threads",
+            "9",
+        ])
+        .output()
+        .expect("run k3-worker a100 with 9 threads");
+    assert_eq!(output_a100_t9.status.code(), Some(10));
+
+    // --cluster x100 with whitespace cpuset encroaching on control core 6 ("  0 - 6  ") -> exit code 10
+    let output_ws_encroach = Command::new(BIN_PATH)
+        .args([
+            "--model",
+            model_path.to_str().unwrap(),
+            "--socket",
+            "/tmp/fake.sock",
+            "--cluster",
+            "x100",
+            "--affinity",
+            "  0 - 6  ",
+        ])
+        .output()
+        .expect("run k3-worker x100 with whitespace 0-6");
+    assert_eq!(output_ws_encroach.status.code(), Some(10));
+
     let _ = std::fs::remove_file(&model_path);
 }
 
@@ -588,6 +656,88 @@ fn test_worker_engine_try_new_fail_closed_validation() {
         k3_engine::worker::WorkerEngine::try_new(config_excess_threads, w3).unwrap_err();
     assert_eq!(err_excess.exit_code(), 10);
     assert!(err_excess.to_string().contains("exceeds 2 available cores"));
+
+    // 4. X100 threads exceeding 6-thread cap (no affinity)
+    let config_x100_t7 = k3_engine::worker::WorkerConfig {
+        socket_path: Some(std::path::PathBuf::from("/tmp/fake_try_new.sock")),
+        socket_fd: None,
+        model_path: model_path.clone(),
+        cluster: "x100".to_owned(),
+        threads: Some(7),
+        affinity: None,
+        verbose: false,
+        listen: false,
+    };
+    let w4 = k3_engine::worker::LockedWeights::open(&model_path).unwrap();
+    let err_x100_t7 = k3_engine::worker::WorkerEngine::try_new(config_x100_t7, w4).unwrap_err();
+    assert_eq!(err_x100_t7.exit_code(), 10);
+    assert!(
+        err_x100_t7
+            .to_string()
+            .contains("exceeding X100 compute cap of 6 threads")
+    );
+
+    // 5. A100 sub-mask thread bounding (threads 3 > cores 8-9) under simulation
+    unsafe {
+        std::env::set_var("K3_SIMULATE_A100", "1");
+    }
+    let config_a100_sub3 = k3_engine::worker::WorkerConfig {
+        socket_path: Some(std::path::PathBuf::from("/tmp/fake_try_new.sock")),
+        socket_fd: None,
+        model_path: model_path.clone(),
+        cluster: "a100".to_owned(),
+        threads: Some(3),
+        affinity: Some("8-9".to_owned()),
+        verbose: false,
+        listen: false,
+    };
+    let w5 = k3_engine::worker::LockedWeights::open(&model_path).unwrap();
+    let err_a100_sub3 = k3_engine::worker::WorkerEngine::try_new(config_a100_sub3, w5).unwrap_err();
+    assert_eq!(err_a100_sub3.exit_code(), 10);
+    assert!(
+        err_a100_sub3
+            .to_string()
+            .contains("exceeds 2 available cores")
+    );
+
+    // 6. Valid threads without affinity on X100 (threads = 4)
+    let config_x100_t4 = k3_engine::worker::WorkerConfig {
+        socket_path: Some(std::path::PathBuf::from("/tmp/fake_try_new.sock")),
+        socket_fd: None,
+        model_path: model_path.clone(),
+        cluster: "x100".to_owned(),
+        threads: Some(4),
+        affinity: None,
+        verbose: false,
+        listen: false,
+    };
+    let w6 = k3_engine::worker::LockedWeights::open(&model_path).unwrap();
+    let engine_x100_t4 =
+        k3_engine::worker::WorkerEngine::try_new(config_x100_t4, w6).expect("engine t4");
+    assert_eq!(engine_x100_t4.thread_count(), 4);
+    assert_eq!(engine_x100_t4.compute_mask(), 0x003F);
+    assert_eq!(engine_x100_t4.assigned_cores(), &[0, 1, 2, 3]);
+
+    // 7. Whitespace in affinity spec ("  0 - 3  ")
+    let config_ws = k3_engine::worker::WorkerConfig {
+        socket_path: Some(std::path::PathBuf::from("/tmp/fake_try_new.sock")),
+        socket_fd: None,
+        model_path: model_path.clone(),
+        cluster: "x100".to_owned(),
+        threads: Some(4),
+        affinity: Some("  0 - 3  ".to_owned()),
+        verbose: false,
+        listen: false,
+    };
+    let w7 = k3_engine::worker::LockedWeights::open(&model_path).unwrap();
+    let engine_ws = k3_engine::worker::WorkerEngine::try_new(config_ws, w7).expect("engine ws");
+    assert_eq!(engine_ws.thread_count(), 4);
+    assert_eq!(engine_ws.compute_mask(), 0x000F);
+    assert_eq!(engine_ws.assigned_cores(), &[0, 1, 2, 3]);
+
+    unsafe {
+        std::env::remove_var("K3_SIMULATE_A100");
+    }
 
     let _ = std::fs::remove_file(&model_path);
 }
