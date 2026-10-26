@@ -16,6 +16,8 @@ pub struct WorkerConfig {
     pub model_path: PathBuf,
     /// Compute cluster target (`x100` or `a100`).
     pub cluster: String,
+    /// Number of worker threads for parallel compute execution.
+    pub threads: Option<usize>,
     /// Explicit core pinning or affinity mask (e.g. `8` or `0x00FF`).
     pub affinity: Option<String>,
     /// Enable verbose diagnostic logging.
@@ -31,6 +33,7 @@ impl Default for WorkerConfig {
             socket_fd: None,
             model_path: PathBuf::new(),
             cluster: "x100".to_owned(),
+            threads: None,
             affinity: None,
             verbose: false,
             listen: false,
@@ -114,11 +117,22 @@ impl WorkerConfig {
                     })?;
                 }
                 "--threads" => {
-                    let _ = args.next().ok_or_else(|| {
+                    let threads_str = args.next().ok_or_else(|| {
                         WorkerError::InvalidArguments(
                             "--threads requires an integer count".to_owned(),
                         )
                     })?;
+                    let threads = threads_str.parse::<usize>().map_err(|e| {
+                        WorkerError::InvalidArguments(format!(
+                            "invalid --threads count '{threads_str}': {e}"
+                        ))
+                    })?;
+                    if threads == 0 {
+                        return Err(WorkerError::InvalidArguments(
+                            "--threads must be greater than 0".to_owned(),
+                        ));
+                    }
+                    config.threads = Some(threads);
                 }
                 "--memlock-limit" => {
                     let _ = args.next().ok_or_else(|| {
@@ -200,7 +214,8 @@ REQUIRED:
 
 OPTIONS:
     --cluster <x100|a100>  Target compute cluster [default: x100]
-    --affinity <core|mask> Explicit core pinning (e.g. 8 or 0xFF00)
+    --threads <count>      Number of compute threads (max 6 on x100, max 8 on a100)
+    --affinity <core|mask> Explicit core pinning (e.g. 8, 0x003F, 0-5, 0xFF00)
     --listen               Listen on socket rather than connecting to supervisor
     --verbose              Enable verbose diagnostic output
     -h, --help             Print help information
