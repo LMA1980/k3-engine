@@ -527,3 +527,67 @@ fn test_cli_non_contiguous_and_cross_cluster_rejections() {
 
     let _ = std::fs::remove_file(&model_path);
 }
+
+#[test]
+fn test_worker_engine_try_new_fail_closed_validation() {
+    let model_path = std::env::temp_dir().join("k3_worker_engine_try_new_model.gguf");
+    {
+        let mut f = File::create(&model_path).unwrap();
+        f.write_all(b"VALID_GGUF_HEADER").unwrap();
+    }
+
+    // 1. Encroaching on active control cores 6-7 (0x00C0)
+    let config_encroach = k3_engine::worker::WorkerConfig {
+        socket_path: Some(std::path::PathBuf::from("/tmp/fake_try_new.sock")),
+        socket_fd: None,
+        model_path: model_path.clone(),
+        cluster: "x100".to_owned(),
+        threads: Some(1),
+        affinity: Some("0x00C0".to_owned()),
+        verbose: false,
+        listen: false,
+    };
+    let w1 = k3_engine::worker::LockedWeights::open(&model_path).unwrap();
+    let err_encroach = k3_engine::worker::WorkerEngine::try_new(config_encroach, w1).unwrap_err();
+    assert_eq!(err_encroach.exit_code(), 10);
+    assert!(
+        err_encroach
+            .to_string()
+            .contains("encroaches on dedicated active control cores")
+    );
+
+    // 2. Unparseable affinity spec
+    let config_unparseable = k3_engine::worker::WorkerConfig {
+        socket_path: Some(std::path::PathBuf::from("/tmp/fake_try_new.sock")),
+        socket_fd: None,
+        model_path: model_path.clone(),
+        cluster: "x100".to_owned(),
+        threads: Some(1),
+        affinity: Some("not_a_valid_mask".to_owned()),
+        verbose: false,
+        listen: false,
+    };
+    let w2 = k3_engine::worker::LockedWeights::open(&model_path).unwrap();
+    let err_unparseable =
+        k3_engine::worker::WorkerEngine::try_new(config_unparseable, w2).unwrap_err();
+    assert_eq!(err_unparseable.exit_code(), 2);
+
+    // 3. Threads exceeding available cores
+    let config_excess_threads = k3_engine::worker::WorkerConfig {
+        socket_path: Some(std::path::PathBuf::from("/tmp/fake_try_new.sock")),
+        socket_fd: None,
+        model_path: model_path.clone(),
+        cluster: "x100".to_owned(),
+        threads: Some(3),
+        affinity: Some("0,2".to_owned()),
+        verbose: false,
+        listen: false,
+    };
+    let w3 = k3_engine::worker::LockedWeights::open(&model_path).unwrap();
+    let err_excess =
+        k3_engine::worker::WorkerEngine::try_new(config_excess_threads, w3).unwrap_err();
+    assert_eq!(err_excess.exit_code(), 10);
+    assert!(err_excess.to_string().contains("exceeds 2 available cores"));
+
+    let _ = std::fs::remove_file(&model_path);
+}

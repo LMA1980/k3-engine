@@ -205,7 +205,13 @@ async fn main() -> ExitCode {
         }
     };
 
-    let mut engine = WorkerEngine::new(config, weights);
+    let mut engine = match WorkerEngine::try_new(config, weights) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("[k3-worker error] failed to initialize engine: {e}");
+            return ExitCode::from(e.exit_code() as u8);
+        }
+    };
 
     // 6. Spawn event loop in background task to allow reactive signal interruption
     let worker_task = tokio::task::spawn_blocking(move || engine.run_event_loop(stream));

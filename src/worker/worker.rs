@@ -23,7 +23,7 @@ use std::thread::{Builder, JoinHandle};
 
 use super::affinity::{
     A100_CLUSTER_MASK, DEFAULT_X100_COMPUTE_CAP_MASK, cores_from_mask, parse_affinity_spec,
-    pin_worker_core,
+    pin_worker_core, verify_cluster_capabilities_full,
 };
 use super::cli::WorkerConfig;
 use super::error::WorkerError;
@@ -73,18 +73,22 @@ impl Drop for WorkerEngine {
 }
 
 impl WorkerEngine {
-    /// Constructs a new [`WorkerEngine`] with the given configuration and loaded weights,
-    /// spawning and pinning compute worker threads according to the assigned compute core mask.
-    #[must_use]
-    pub fn new(config: WorkerConfig, weights: LockedWeights) -> Self {
+    /// Attempts to construct a new [`WorkerEngine`] with the given configuration and loaded weights.
+    ///
+    /// Validates cluster capabilities, thread bounds, and affinity specifications upfront (failing closed).
+    ///
+    /// # Errors
+    /// Returns [`WorkerError`] if configuration, affinity, or hardware verification fails.
+    pub fn try_new(config: WorkerConfig, weights: LockedWeights) -> Result<Self, WorkerError> {
+        verify_cluster_capabilities_full(
+            &config.cluster,
+            config.affinity.as_deref(),
+            config.threads,
+            std::env::var("K3_SIMULATE_A100").ok().as_deref(),
+        )?;
+
         let compute_mask = if let Some(spec) = &config.affinity {
-            parse_affinity_spec(spec).map(|(_, m)| m).unwrap_or(
-                if config.cluster.eq_ignore_ascii_case("a100") {
-                    A100_CLUSTER_MASK
-                } else {
-                    DEFAULT_X100_COMPUTE_CAP_MASK
-                },
-            )
+            parse_affinity_spec(spec)?.1
         } else if config.cluster.eq_ignore_ascii_case("a100") {
             A100_CLUSTER_MASK
         } else {
@@ -129,7 +133,7 @@ impl WorkerEngine {
             }
         }
 
-        Self {
+        Ok(Self {
             config,
             weights,
             arena: None,
@@ -138,7 +142,17 @@ impl WorkerEngine {
             compute_mask,
             assigned_cores,
             thread_workers,
-        }
+        })
+    }
+
+    /// Constructs a new [`WorkerEngine`] with the given configuration and loaded weights,
+    /// spawning and pinning compute worker threads according to the assigned compute core mask.
+    ///
+    /// # Panics
+    /// Panics if configuration or affinity validation fails.
+    #[must_use]
+    pub fn new(config: WorkerConfig, weights: LockedWeights) -> Self {
+        Self::try_new(config, weights).expect("failed to construct WorkerEngine from config")
     }
 
     /// Returns the resolved compute core bitmask.

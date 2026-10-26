@@ -203,12 +203,7 @@ pub fn verify_cluster_capabilities_full(
         None
     };
 
-    let targets_a100 = is_a100
-        || parsed_aff
-            .as_ref()
-            .is_some_and(|(core, mask)| *core >= 8 || (mask & A100_CLUSTER_MASK) != 0);
-
-    if targets_a100 {
+    if is_a100 {
         if let Some((_core, mask)) = parsed_aff {
             // Check active control core encroachment (0x00C0)
             if (mask & DEFAULT_ACTIVE_CONTROL_MASK) != 0 {
@@ -272,7 +267,7 @@ pub fn verify_cluster_capabilities_full(
         }
     }
 
-    if !targets_a100 {
+    if !is_a100 {
         return Ok(());
     }
 
