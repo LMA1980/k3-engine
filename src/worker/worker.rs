@@ -18,9 +18,35 @@ use k3_core::ipc::protocol::{
 use k3_core::ipc::shm::SharedMemoryArena;
 use zerocopy::FromBytes;
 
+use std::sync::mpsc::{Sender, channel};
+use std::thread::{Builder, JoinHandle};
+
+use super::affinity::{
+    A100_CLUSTER_MASK, DEFAULT_X100_COMPUTE_CAP_MASK, cores_from_mask, parse_affinity_spec,
+    pin_worker_core,
+};
 use super::cli::WorkerConfig;
 use super::error::WorkerError;
 use super::weights::LockedWeights;
+
+enum ComputeTask {
+    Execute(Arc<dyn Fn() + Send + Sync>),
+    Shutdown,
+}
+
+struct WorkerThreadHandle {
+    sender: Sender<ComputeTask>,
+    handle: Option<JoinHandle<()>>,
+    assigned_core: usize,
+}
+
+impl std::fmt::Debug for WorkerThreadHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerThreadHandle")
+            .field("assigned_core", &self.assigned_core)
+            .finish()
+    }
+}
 
 /// Isolated compute worker execution engine.
 #[derive(Debug)]
@@ -30,19 +56,105 @@ pub struct WorkerEngine {
     arena: Option<SharedMemoryArena>,
     completed_passes: u64,
     is_busy: bool,
+    compute_mask: u64,
+    assigned_cores: Vec<usize>,
+    thread_workers: Vec<WorkerThreadHandle>,
+}
+
+impl Drop for WorkerEngine {
+    fn drop(&mut self) {
+        for worker in &mut self.thread_workers {
+            let _ = worker.sender.send(ComputeTask::Shutdown);
+            if let Some(h) = worker.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
 }
 
 impl WorkerEngine {
-    /// Constructs a new [`WorkerEngine`] with the given configuration and loaded weights.
+    /// Constructs a new [`WorkerEngine`] with the given configuration and loaded weights,
+    /// spawning and pinning compute worker threads according to the assigned compute core mask.
     #[must_use]
     pub fn new(config: WorkerConfig, weights: LockedWeights) -> Self {
+        let compute_mask = if let Some(spec) = &config.affinity {
+            parse_affinity_spec(spec).map(|(_, m)| m).unwrap_or(
+                if config.cluster.eq_ignore_ascii_case("a100") {
+                    A100_CLUSTER_MASK
+                } else {
+                    DEFAULT_X100_COMPUTE_CAP_MASK
+                },
+            )
+        } else if config.cluster.eq_ignore_ascii_case("a100") {
+            A100_CLUSTER_MASK
+        } else {
+            DEFAULT_X100_COMPUTE_CAP_MASK
+        };
+
+        let available_cores = cores_from_mask(compute_mask);
+        let thread_count = config.threads.unwrap_or(available_cores.len().max(1));
+        let assigned_cores: Vec<usize> = if available_cores.is_empty() {
+            vec![0]
+        } else {
+            (0..thread_count)
+                .map(|i| available_cores[i % available_cores.len()])
+                .collect()
+        };
+
+        let mut thread_workers = Vec::with_capacity(assigned_cores.len());
+        for (i, &core) in assigned_cores.iter().enumerate() {
+            let (tx, rx) = channel::<ComputeTask>();
+            let handle = Builder::new()
+                .name(format!("k3-worker-compute-{i}"))
+                .spawn(move || {
+                    // SAFETY: Scalar-only thread pinning routine avoids scalable vector register spills.
+                    unsafe {
+                        let _ = pin_worker_core(core);
+                    }
+                    while let Ok(task) = rx.recv() {
+                        match task {
+                            ComputeTask::Execute(f) => f(),
+                            ComputeTask::Shutdown => break,
+                        }
+                    }
+                })
+                .ok();
+
+            thread_workers.push(WorkerThreadHandle {
+                sender: tx,
+                handle,
+                assigned_core: core,
+            });
+        }
+
         Self {
             config,
             weights,
             arena: None,
             completed_passes: 0,
             is_busy: false,
+            compute_mask,
+            assigned_cores,
+            thread_workers,
         }
+    }
+
+    /// Returns the resolved compute core bitmask.
+    #[must_use]
+    pub const fn compute_mask(&self) -> u64 {
+        self.compute_mask
+    }
+
+    /// Returns the list of assigned cores for all compute worker threads.
+    #[must_use]
+    pub fn assigned_cores(&self) -> &[usize] {
+        &self.assigned_cores
+    }
+
+    /// Returns the number of compute worker threads.
+    #[must_use]
+    pub fn thread_count(&self) -> usize {
+        self.assigned_cores.len()
     }
 
     /// Returns a reference to the active configuration.
@@ -202,6 +314,18 @@ impl WorkerEngine {
                     // Reference mathematical computation for synthetic forward output logits:
                     // logit[t] = token_id * 0.01 + pos * 0.1
                     let mut logits = vec![0.0_f32; vocab_size];
+                    if self.thread_workers.len() > 1 {
+                        let (done_tx, done_rx) = channel();
+                        for worker in &self.thread_workers {
+                            let tx = done_tx.clone();
+                            let _ = worker.sender.send(ComputeTask::Execute(Arc::new(move || {
+                                let _ = tx.send(());
+                            })));
+                        }
+                        for _ in 0..self.thread_workers.len() {
+                            let _ = done_rx.recv();
+                        }
+                    }
                     for (i, val) in logits.iter_mut().enumerate() {
                         let token_term = if !token_vals.is_empty() {
                             (token_vals[i % token_vals.len()] as f32) * 0.01

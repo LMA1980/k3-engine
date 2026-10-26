@@ -22,8 +22,10 @@ pub mod weights;
 pub mod worker;
 
 pub use affinity::{
-    A100_CLUSTER_MASK, X100_CLUSTER_MASK, parse_affinity_spec, pin_worker_core,
-    verify_cluster_capabilities,
+    A100_CLUSTER_MASK, A100_DEFAULT_MAX_COMPUTE_THREADS, DEFAULT_ACTIVE_CONTROL_MASK,
+    DEFAULT_X100_COMPUTE_CAP_MASK, X100_CLUSTER_MASK, X100_DEFAULT_MAX_COMPUTE_THREADS,
+    cores_from_mask, parse_affinity_spec, pin_worker_core, verify_cluster_capabilities,
+    verify_cluster_capabilities_full,
 };
 pub use cli::{WorkerConfig, print_usage};
 pub use error::{

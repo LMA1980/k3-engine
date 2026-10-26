@@ -17,7 +17,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use k3_engine::worker::affinity::{
-    parse_affinity_spec, pin_worker_core, verify_cluster_capabilities,
+    A100_CLUSTER_MASK, DEFAULT_X100_COMPUTE_CAP_MASK, cores_from_mask, parse_affinity_spec,
+    pin_worker_core, verify_cluster_capabilities_full,
 };
 use k3_engine::worker::cli::WorkerConfig;
 use k3_engine::worker::error::{EXIT_INVALID_ARGS, EXIT_PROTOCOL_ERROR};
@@ -40,15 +41,21 @@ async fn main() -> ExitCode {
 
     if config.verbose {
         eprintln!(
-            "[k3-worker] starting worker: model={}, cluster={}, affinity={:?}",
+            "[k3-worker] starting worker: model={}, cluster={}, threads={:?}, affinity={:?}",
             config.model_path.display(),
             config.cluster,
+            config.threads,
             config.affinity
         );
     }
 
-    // 1. Validate cluster and hardware capabilities
-    if let Err(e) = verify_cluster_capabilities(&config.cluster, config.affinity.as_deref()) {
+    // 1. Validate cluster, threads, affinity, and hardware capabilities
+    if let Err(e) = verify_cluster_capabilities_full(
+        &config.cluster,
+        config.affinity.as_deref(),
+        config.threads,
+        env::var("K3_SIMULATE_A100").ok().as_deref(),
+    ) {
         eprintln!("[k3-worker error] capability verification failed: {e}");
         return ExitCode::from(e.exit_code() as u8);
     }
@@ -70,24 +77,33 @@ async fn main() -> ExitCode {
         );
     }
 
-    // 3. Pin thread affinity if requested
-    if let Some(spec) = &config.affinity {
+    // 3. Pin primary thread affinity
+    let compute_mask = if let Some(spec) = &config.affinity {
         match parse_affinity_spec(spec) {
-            Ok((core, _)) => {
-                // SAFETY: Scalar-only thread pinning routine avoids scalable vector register spills.
-                let pin_res = unsafe { pin_worker_core(core) };
-                if let Err(e) = pin_res {
-                    eprintln!("[k3-worker error] failed to pin thread to core {core}: {e}");
-                    return ExitCode::from(e.exit_code() as u8);
-                }
-                if config.verbose {
-                    eprintln!("[k3-worker] pinned to core {core}");
-                }
-            }
+            Ok((_, mask)) => mask,
             Err(e) => {
                 eprintln!("[k3-worker error] invalid affinity spec: {e}");
                 return ExitCode::from(EXIT_INVALID_ARGS as u8);
             }
+        }
+    } else if config.cluster.eq_ignore_ascii_case("a100") {
+        A100_CLUSTER_MASK
+    } else {
+        DEFAULT_X100_COMPUTE_CAP_MASK
+    };
+
+    let available_cores = cores_from_mask(compute_mask);
+    if let Some(&primary_core) = available_cores.first() {
+        // SAFETY: Scalar-only thread pinning routine avoids scalable vector register spills.
+        let pin_res = unsafe { pin_worker_core(primary_core) };
+        if let Err(e) = pin_res {
+            eprintln!("[k3-worker error] failed to pin thread to core {primary_core}: {e}");
+            return ExitCode::from(e.exit_code() as u8);
+        }
+        if config.verbose {
+            eprintln!(
+                "[k3-worker] pinned primary thread to core {primary_core} (mask: 0x{compute_mask:04X})"
+            );
         }
     }
 

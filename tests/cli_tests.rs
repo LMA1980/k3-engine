@@ -303,3 +303,146 @@ fn test_signal_termination_sigint_and_sigterm_exit_0() {
 
     let _ = std::fs::remove_file(&model_path);
 }
+
+#[test]
+fn test_cli_threads_rejections() {
+    let model_path = std::env::temp_dir().join("k3_worker_threads_test_model.gguf");
+    {
+        let mut f = File::create(&model_path).unwrap();
+        f.write_all(b"VALID_GGUF_HEADER").unwrap();
+    }
+
+    // --threads 0 -> exit code 2 (InvalidArguments)
+    let output = Command::new(BIN_PATH)
+        .args([
+            "--model",
+            model_path.to_str().unwrap(),
+            "--socket",
+            "/tmp/fake.sock",
+            "--threads",
+            "0",
+        ])
+        .output()
+        .expect("run k3-worker --threads 0");
+    assert_eq!(output.status.code(), Some(2));
+
+    // --threads 7 on x100 -> exit code 10 (CapabilityMismatch: exceeds X100 cap of 6)
+    let output = Command::new(BIN_PATH)
+        .args([
+            "--model",
+            model_path.to_str().unwrap(),
+            "--socket",
+            "/tmp/fake.sock",
+            "--cluster",
+            "x100",
+            "--threads",
+            "7",
+        ])
+        .output()
+        .expect("run k3-worker --threads 7 on x100");
+    assert_eq!(output.status.code(), Some(10));
+
+    // --affinity 0x00C0 on x100 encroaches on control cores -> exit code 10
+    let output = Command::new(BIN_PATH)
+        .args([
+            "--model",
+            model_path.to_str().unwrap(),
+            "--socket",
+            "/tmp/fake.sock",
+            "--cluster",
+            "x100",
+            "--affinity",
+            "0x00C0",
+        ])
+        .output()
+        .expect("run k3-worker --affinity 0x00C0 on x100");
+    assert_eq!(output.status.code(), Some(10));
+
+    // --affinity 0x00FF on x100 encroaches on control cores 6-7 -> exit code 10
+    let output = Command::new(BIN_PATH)
+        .args([
+            "--model",
+            model_path.to_str().unwrap(),
+            "--socket",
+            "/tmp/fake.sock",
+            "--cluster",
+            "x100",
+            "--affinity",
+            "0x00FF",
+        ])
+        .output()
+        .expect("run k3-worker --affinity 0x00FF on x100");
+    assert_eq!(output.status.code(), Some(10));
+
+    // --affinity 0-6 on x100 encroaches on control core 6 -> exit code 10
+    let output = Command::new(BIN_PATH)
+        .args([
+            "--model",
+            model_path.to_str().unwrap(),
+            "--socket",
+            "/tmp/fake.sock",
+            "--cluster",
+            "x100",
+            "--affinity",
+            "0-6",
+        ])
+        .output()
+        .expect("run k3-worker --affinity 0-6 on x100");
+    assert_eq!(output.status.code(), Some(10));
+
+    // --affinity 0-3 with --threads 5 -> exit code 10 (threads exceed available cores)
+    let output = Command::new(BIN_PATH)
+        .args([
+            "--model",
+            model_path.to_str().unwrap(),
+            "--socket",
+            "/tmp/fake.sock",
+            "--cluster",
+            "x100",
+            "--affinity",
+            "0-3",
+            "--threads",
+            "5",
+        ])
+        .output()
+        .expect("run k3-worker --threads 5 on 4 cores");
+    assert_eq!(output.status.code(), Some(10));
+
+    let _ = std::fs::remove_file(&model_path);
+}
+
+#[test]
+fn test_worker_engine_multi_thread_affinity_and_no_control_encroachment() {
+    let model_path = std::env::temp_dir().join("k3_worker_engine_threads_model.gguf");
+    {
+        let mut f = File::create(&model_path).unwrap();
+        f.write_all(b"VALID_GGUF_HEADER").unwrap();
+    }
+
+    let config = k3_engine::worker::WorkerConfig {
+        socket_path: Some(std::path::PathBuf::from("/tmp/fake_engine.sock")),
+        socket_fd: None,
+        model_path: model_path.clone(),
+        cluster: "x100".to_owned(),
+        threads: Some(4),
+        affinity: Some("0-3".to_owned()),
+        verbose: false,
+        listen: false,
+    };
+    let weights = k3_engine::worker::LockedWeights::open(&model_path).unwrap();
+    let engine = k3_engine::worker::WorkerEngine::new(config, weights);
+
+    assert_eq!(engine.thread_count(), 4);
+    assert_eq!(engine.compute_mask(), 0x000F);
+    assert_eq!(engine.assigned_cores(), &[0, 1, 2, 3]);
+    // Assert zero compute threads ever run on dedicated active control cores 6 or 7
+    for &core in engine.assigned_cores() {
+        assert!(
+            core < 6,
+            "core {core} must not encroach on active control cores 6-7"
+        );
+        assert_eq!((1_u64 << core) & 0x00C0, 0);
+    }
+
+    let _ = std::fs::remove_file(&model_path);
+}

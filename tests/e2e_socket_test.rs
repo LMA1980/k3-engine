@@ -75,6 +75,7 @@ fn test_e2e_worker_engine_socket_loop_and_zerocopy_dispatch() {
         socket_fd: Some(worker_sock.as_raw_fd()),
         model_path: model_path.clone(),
         cluster: "x100".to_owned(),
+        threads: None,
         affinity: None,
         verbose: true,
         listen: false,
