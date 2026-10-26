@@ -92,7 +92,7 @@ impl WorkerEngine {
         };
 
         let available_cores = cores_from_mask(compute_mask);
-        let thread_count = config.threads.unwrap_or(available_cores.len().max(1));
+        let thread_count = config.threads.unwrap_or(available_cores.len()).max(1);
         let assigned_cores: Vec<usize> = if available_cores.is_empty() {
             vec![0]
         } else {
@@ -104,27 +104,29 @@ impl WorkerEngine {
         let mut thread_workers = Vec::with_capacity(assigned_cores.len());
         for (i, &core) in assigned_cores.iter().enumerate() {
             let (tx, rx) = channel::<ComputeTask>();
-            let handle = Builder::new()
-                .name(format!("k3-worker-compute-{i}"))
-                .spawn(move || {
-                    // SAFETY: Scalar-only thread pinning routine avoids scalable vector register spills.
-                    unsafe {
-                        let _ = pin_worker_core(core);
-                    }
-                    while let Ok(task) = rx.recv() {
-                        match task {
-                            ComputeTask::Execute(f) => f(),
-                            ComputeTask::Shutdown => break,
+            let spawn_res =
+                Builder::new()
+                    .name(format!("k3-worker-compute-{i}"))
+                    .spawn(move || {
+                        // SAFETY: Scalar-only thread pinning routine avoids scalable vector register spills.
+                        unsafe {
+                            let _ = pin_worker_core(core);
                         }
-                    }
-                })
-                .ok();
+                        while let Ok(task) = rx.recv() {
+                            match task {
+                                ComputeTask::Execute(f) => f(),
+                                ComputeTask::Shutdown => break,
+                            }
+                        }
+                    });
 
-            thread_workers.push(WorkerThreadHandle {
-                sender: tx,
-                handle,
-                assigned_core: core,
-            });
+            if let Ok(handle) = spawn_res {
+                thread_workers.push(WorkerThreadHandle {
+                    sender: tx,
+                    handle: Some(handle),
+                    assigned_core: core,
+                });
+            }
         }
 
         Self {
@@ -314,15 +316,27 @@ impl WorkerEngine {
                     // Reference mathematical computation for synthetic forward output logits:
                     // logit[t] = token_id * 0.01 + pos * 0.1
                     let mut logits = vec![0.0_f32; vocab_size];
-                    if self.thread_workers.len() > 1 {
+                    let active_workers: Vec<_> = self
+                        .thread_workers
+                        .iter()
+                        .filter(|w| w.handle.is_some())
+                        .collect();
+                    if active_workers.len() > 1 {
                         let (done_tx, done_rx) = channel();
-                        for worker in &self.thread_workers {
+                        let mut sent = 0;
+                        for worker in &active_workers {
                             let tx = done_tx.clone();
-                            let _ = worker.sender.send(ComputeTask::Execute(Arc::new(move || {
-                                let _ = tx.send(());
-                            })));
+                            if worker
+                                .sender
+                                .send(ComputeTask::Execute(Arc::new(move || {
+                                    let _ = tx.send(());
+                                })))
+                                .is_ok()
+                            {
+                                sent += 1;
+                            }
                         }
-                        for _ in 0..self.thread_workers.len() {
+                        for _ in 0..sent {
                             let _ = done_rx.recv();
                         }
                     }

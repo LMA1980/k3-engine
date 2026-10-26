@@ -320,7 +320,7 @@ pub unsafe fn pin_worker_core(assigned_core: usize) -> Result<(), WorkerError> {
         // SAFETY: Direct Linux syscall without vector registers in stack frame.
         unsafe {
             let tid = libc::syscall(libc::SYS_gettid);
-            if assigned_core >= 8 {
+            if assigned_core >= 8 && tid > 0 {
                 let path = b"/proc/set_ai_thread\0";
                 let fd = libc::open(path.as_ptr().cast::<libc::c_char>(), libc::O_WRONLY);
                 if fd >= 0 {
@@ -328,18 +328,13 @@ pub unsafe fn pin_worker_core(assigned_core: usize) -> Result<(), WorkerError> {
                     let mut val = tid;
                     let mut tmp = [0u8; 32];
                     let mut i = 0;
-                    if val == 0 {
-                        buf[0] = b'0';
-                        i = 1;
-                    } else {
-                        while val > 0 {
-                            tmp[i] = b'0' + (val % 10) as u8;
-                            val /= 10;
-                            i += 1;
-                        }
-                        for j in 0..i {
-                            buf[j] = tmp[i - 1 - j];
-                        }
+                    while val > 0 {
+                        tmp[i] = b'0' + (val % 10) as u8;
+                        val /= 10;
+                        i += 1;
+                    }
+                    for j in 0..i {
+                        buf[j] = tmp[i - 1 - j];
                     }
                     buf[i] = b'\n';
                     let _ = libc::write(fd, buf.as_ptr().cast::<libc::c_void>(), i + 1);
