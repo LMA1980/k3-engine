@@ -17,9 +17,10 @@ pub use worker as k3_worker;
 
 pub use affinity::{
     A100_CLUSTER_MASK, A100_DEFAULT_MAX_COMPUTE_THREADS, ClusterPreset, CpuTopologyInspector,
-    FutexBarrier, MockCpuTopology, ResolvedAffinity, SpinBarrier, SystemCpuTopology, VlenDomain,
-    WorkerAffinityStatus, WorkerPool, WorkerWaitSlot, X100_CLUSTER_MASK,
-    X100_DEFAULT_MAX_COMPUTE_THREADS, parse_cpu_list_mask, resolve_affinity, resolve_affinity_with,
+    FutexBarrier, IntoClusterPreset, MockCpuTopology, ResolvedAffinity, SpinBarrier,
+    SystemCpuTopology, VlenDomain, WorkerAffinityStatus, WorkerPool, WorkerWaitSlot,
+    X100_CLUSTER_MASK, X100_DEFAULT_MAX_COMPUTE_THREADS, parse_cpu_list_mask, resolve_affinity,
+    resolve_affinity_with,
 };
 pub use capability::{RecipeRegistry, verify_metadata_capabilities, verify_model_capabilities};
 pub use engine::{
@@ -27,8 +28,11 @@ pub use engine::{
     sample_greedy_argmax,
 };
 pub use k3_core::{
-    self, ArchRecipe, CoordinationProfile, ExecutionContext, GgufFile, K3Error, ModelMetadata,
-    ModelWeights, QuantType, TensorDescriptor, TensorView,
+    self, ArchRecipe, CONSERVATIVE_DEFAULT_A100_CORES, CONSERVATIVE_DEFAULT_N_CTX,
+    CONSERVATIVE_DEFAULT_X100_CORES, CONSERVATIVE_TUNING_ADVISORY, CONSTRAINED_TEST_N_CTX,
+    ComputePool, CoordinationProfile, ExecutionContext, GgufFile, K3Error, ModelEntry,
+    ModelListResponse, ModelLoadAuditEvent, ModelMetadata, ModelProfile, ModelWeights,
+    PriorityClass, ProfileStatus, QuantType, TensorDescriptor, TensorView, TuningProfile,
 };
 pub use kv::SingleSlotKvArena;
 pub use memory::{
