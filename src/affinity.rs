@@ -11,7 +11,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use k3_core::{CoordinationProfile, K3Error};
+use k3_core::{ComputePool, CoordinationProfile, K3Error};
 use serde::{Deserialize, Serialize};
 
 thread_local! {
@@ -124,6 +124,62 @@ impl ClusterPreset {
             Self::X100 => X100_DEFAULT_MAX_COMPUTE_THREADS,
             Self::A100 => A100_DEFAULT_MAX_COMPUTE_THREADS,
         }
+    }
+
+    /// Converts a [`ComputePool`] to an optional [`ClusterPreset`].
+    ///
+    /// Returns `Some(ClusterPreset::X100)` for [`ComputePool::X100`],
+    /// `Some(ClusterPreset::A100)` for [`ComputePool::A100`], and `None` for
+    /// [`ComputePool::Both`].
+    #[must_use]
+    pub const fn from_compute_pool(pool: ComputePool) -> Option<Self> {
+        match pool {
+            ComputePool::X100 => Some(Self::X100),
+            ComputePool::A100 => Some(Self::A100),
+            ComputePool::Both => None,
+        }
+    }
+
+    /// Converts this cluster preset to its corresponding [`ComputePool`].
+    #[must_use]
+    pub const fn to_compute_pool(&self) -> ComputePool {
+        match self {
+            Self::X100 => ComputePool::X100,
+            Self::A100 => ComputePool::A100,
+        }
+    }
+}
+
+impl TryFrom<ComputePool> for ClusterPreset {
+    type Error = K3Error;
+
+    fn try_from(pool: ComputePool) -> Result<Self, Self::Error> {
+        match pool {
+            ComputePool::X100 => Ok(Self::X100),
+            ComputePool::A100 => Ok(Self::A100),
+            ComputePool::Both => Err(K3Error::CapabilityMismatch {
+                architecture: "cluster".to_owned(),
+                reason: "ComputePool::Both cannot be converted to a single ClusterPreset"
+                    .to_owned(),
+            }),
+        }
+    }
+}
+
+/// Extension trait converting a [`ComputePool`] into an [`Option<ClusterPreset>`].
+pub trait IntoClusterPreset {
+    /// Converts this compute pool into an optional cluster preset.
+    ///
+    /// Returns `Some(ClusterPreset::X100)` for [`ComputePool::X100`],
+    /// `Some(ClusterPreset::A100)` for [`ComputePool::A100`], and `None` for
+    /// [`ComputePool::Both`].
+    #[must_use]
+    fn into_cluster_preset(self) -> Option<ClusterPreset>;
+}
+
+impl IntoClusterPreset for ComputePool {
+    fn into_cluster_preset(self) -> Option<ClusterPreset> {
+        ClusterPreset::from_compute_pool(self)
     }
 }
 
@@ -2301,5 +2357,41 @@ mod tests {
                 .to_string()
                 .contains("does not cover both clusters")
         );
+    }
+
+    #[test]
+    fn test_compute_pool_cluster_preset_conversions() {
+        assert_eq!(
+            ClusterPreset::from_compute_pool(ComputePool::X100),
+            Some(ClusterPreset::X100)
+        );
+        assert_eq!(
+            ClusterPreset::from_compute_pool(ComputePool::A100),
+            Some(ClusterPreset::A100)
+        );
+        assert_eq!(ClusterPreset::from_compute_pool(ComputePool::Both), None);
+
+        assert_eq!(
+            ComputePool::X100.into_cluster_preset(),
+            Some(ClusterPreset::X100)
+        );
+        assert_eq!(
+            ComputePool::A100.into_cluster_preset(),
+            Some(ClusterPreset::A100)
+        );
+        assert_eq!(ComputePool::Both.into_cluster_preset(), None);
+
+        assert_eq!(
+            ClusterPreset::try_from(ComputePool::X100).unwrap(),
+            ClusterPreset::X100
+        );
+        assert_eq!(
+            ClusterPreset::try_from(ComputePool::A100).unwrap(),
+            ClusterPreset::A100
+        );
+        assert!(ClusterPreset::try_from(ComputePool::Both).is_err());
+
+        assert_eq!(ClusterPreset::X100.to_compute_pool(), ComputePool::X100);
+        assert_eq!(ClusterPreset::A100.to_compute_pool(), ComputePool::A100);
     }
 }
