@@ -96,6 +96,8 @@ impl From<K3Error> for WorkerError {
             K3Error::ContextLengthExceeded { .. } => Self::ResourceExhausted(err.to_string()),
             K3Error::AffinityError { reason, .. } => Self::CapabilityMismatch(reason),
             K3Error::TensorBoundsError { reason, .. } => Self::ProtocolError(reason),
+            K3Error::RoutingUnavailable { reason } => Self::ProtocolError(reason),
+            K3Error::QueueSaturated { .. } => Self::ResourceExhausted(err.to_string()),
         }
     }
 }
