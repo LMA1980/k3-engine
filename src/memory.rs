@@ -49,9 +49,32 @@ pub struct MemoryFootprint {
 ///
 /// Returns [`K3Error::ContextLengthExceeded`] if `n_ctx` exceeds the model's trained context limit.
 /// Returns [`K3Error::CapabilityMismatch`] if `n_ctx` is zero or if required architecture dimensions are zero.
+/// Computes the exact page-aligned memory footprint required for model weights
+/// and a standalone single-slot KV cache arena sized to `n_ctx` tokens (ADR-027, ADR-037).
+///
+/// # Errors
+///
+/// Returns [`K3Error::ContextLengthExceeded`] if `n_ctx` exceeds the model's trained context limit.
+/// Returns [`K3Error::CapabilityMismatch`] if `n_ctx` is zero or if required architecture dimensions are zero.
 pub fn calculate_footprint(
     metadata: &ModelMetadata,
     n_ctx: usize,
+) -> Result<MemoryFootprint, K3Error> {
+    calculate_footprint_with_slots(metadata, n_ctx, 1)
+}
+
+/// Computes the exact page-aligned memory footprint required for model weights
+/// and a standalone KV cache arena sized to `n_ctx` tokens across `active_slots` concurrency slots (ADR-027, ADR-037, ADR-043).
+///
+/// # Errors
+///
+/// Returns [`K3Error::ContextLengthExceeded`] if `n_ctx` exceeds the model's trained context limit.
+/// Returns [`K3Error::CapabilityMismatch`] if `n_ctx` is zero or if required architecture dimensions are zero.
+#[allow(clippy::too_many_lines)]
+pub fn calculate_footprint_with_slots(
+    metadata: &ModelMetadata,
+    n_ctx: usize,
+    active_slots: usize,
 ) -> Result<MemoryFootprint, K3Error> {
     if n_ctx == 0 {
         return Err(K3Error::CapabilityMismatch {
@@ -81,8 +104,19 @@ pub fn calculate_footprint(
             reason: "aligned weight bytes overflow u64".to_owned(),
         })?;
 
-    // 2. Standalone single-slot KV cache footprint (16-token blocks, page-aligned)
-    let kv_block_count = n_ctx.div_ceil(KV_BLOCK_SIZE);
+    // 2. Standalone KV cache footprint (16-token blocks scaled by active_slots, page-aligned)
+    let blocks_per_slot = n_ctx.div_ceil(KV_BLOCK_SIZE);
+    let slots = active_slots.max(1);
+    let kv_block_count =
+        blocks_per_slot
+            .checked_mul(slots)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: usize::MAX,
+                reason: "kv block count calculation overflowed usize".to_owned(),
+            })?;
     let kv_allocated_tokens =
         kv_block_count
             .checked_mul(KV_BLOCK_SIZE)
@@ -335,7 +369,21 @@ pub fn check_memory_admission_with<I: MemoryInspector>(
     n_ctx: usize,
     inspector: &I,
 ) -> Result<MemoryFootprint, K3Error> {
-    let footprint = calculate_footprint(metadata, n_ctx)?;
+    check_memory_admission_with_slots(metadata, n_ctx, 1, inspector)
+}
+
+/// Verifies pre-flight memory admission accounting for active concurrency slots using a customized inspector.
+///
+/// # Errors
+///
+/// Returns [`K3Error::InsufficientLockableMemory`] if required footprint exceeds lockable limits.
+pub fn check_memory_admission_with_slots<I: MemoryInspector>(
+    metadata: &ModelMetadata,
+    n_ctx: usize,
+    active_slots: usize,
+    inspector: &I,
+) -> Result<MemoryFootprint, K3Error> {
+    let footprint = calculate_footprint_with_slots(metadata, n_ctx, active_slots)?;
     let available_bytes = inspector.available_memory_bytes()?;
     let rlimit_memlock_bytes = inspector.rlimit_memlock_bytes()?;
 
@@ -480,5 +528,25 @@ mod tests {
                 max_context_tokens: 2048,
             }
         );
+    }
+
+    #[test]
+    fn test_calculate_footprint_scales_with_active_slots() {
+        let tensor_specs = [("weight", QuantType::F32, &[16][..])];
+        let bytes = create_synthetic_gguf_v3("synthetic", 32, &tensor_specs);
+        let model = GgufFile::parse(&bytes).expect("parse model");
+        let meta = model.metadata();
+
+        // 32 tokens = 2 blocks of 16
+        let fp1 = calculate_footprint_with_slots(meta, 32, 1).expect("footprint 1 slot");
+        assert_eq!(fp1.kv_block_count, 2);
+        assert_eq!(fp1.kv_allocated_tokens, 32);
+
+        // 4 slots: 2 * 4 = 8 blocks = 128 tokens
+        let fp4 = calculate_footprint_with_slots(meta, 32, 4).expect("footprint 4 slots");
+        assert_eq!(fp4.kv_block_count, 8);
+        assert_eq!(fp4.kv_allocated_tokens, 128);
+        assert!(fp4.kv_bytes > fp1.kv_bytes);
+        assert_eq!(fp4.weight_bytes, fp1.weight_bytes);
     }
 }

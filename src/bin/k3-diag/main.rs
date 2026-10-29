@@ -400,6 +400,8 @@ pub const fn exit_code_for_error(err: &K3Error) -> u8 {
         K3Error::ContextLengthExceeded { .. } => 12,
         K3Error::AffinityError { .. } => 13,
         K3Error::TensorBoundsError { .. } => 14,
+        K3Error::RoutingUnavailable { .. } => 15,
+        K3Error::QueueSaturated { .. } => 23,
     }
 }
 

@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use k3_core::ipc::arrow::wrap_tokens_as_uint32_array;
 use k3_core::ipc::layout::{
-    KvBlockTag, OutputSlabHeader, SLAB_STATUS_WRITTEN, TokenInputSlotHeader,
+    BLOCK_SIZE_TOKENS, KvBlockTag, OutputSlabHeader, SLAB_STATUS_WRITTEN, TokenInputSlotHeader,
 };
 use k3_core::ipc::protocol::{
     AttachArenaCommand, ForwardPassCommand, ForwardPassCompleted, IpcMessage, StatusCode,
@@ -373,18 +373,50 @@ impl WorkerEngine {
                         .map(|(idx, _)| idx as u32)
                         .unwrap_or(0);
 
-                    // Mutate KvBlockMeta in place in shared memory
+                    // Deterministic in-place KvBlockMeta checkpointing per forward pass
                     let blocks_to_update = if cmd.block_indices.is_empty() {
                         vec![0_u32]
                     } else {
                         cmd.block_indices.clone()
                     };
 
-                    for &b_idx in &blocks_to_update {
+                    let total_tokens = cmd.token_offset + cmd.token_count;
+                    let rng_state = if cmd.is_prefill {
+                        [987654321, 0, 0, 0]
+                    } else {
+                        let mut st = {
+                            let first_block = arena.block_meta(blocks_to_update[0] as usize)?;
+                            if st_is_zero(&first_block.sampler_rng_state) {
+                                [42, 0, 0, 0]
+                            } else {
+                                first_block.sampler_rng_state
+                            }
+                        };
+                        step_xoshiro256ss(&mut st);
+                        st
+                    };
+
+                    for (seq_idx, &b_idx) in blocks_to_update.iter().enumerate() {
                         let block = arena.block_meta_mut(b_idx as usize)?;
-                        block.set_committed_tokens(cmd.token_count);
+                        let committed = if cmd.is_prefill && blocks_to_update.len() <= 1 {
+                            cmd.token_count.min(BLOCK_SIZE_TOKENS)
+                        } else {
+                            let block_start = if blocks_to_update.len() <= 1 {
+                                (cmd.token_offset / BLOCK_SIZE_TOKENS) * BLOCK_SIZE_TOKENS
+                            } else {
+                                (seq_idx as u32) * BLOCK_SIZE_TOKENS
+                            };
+                            if total_tokens >= block_start + BLOCK_SIZE_TOKENS {
+                                BLOCK_SIZE_TOKENS
+                            } else {
+                                total_tokens
+                                    .saturating_sub(block_start)
+                                    .min(BLOCK_SIZE_TOKENS)
+                            }
+                        };
+                        block.set_committed_tokens(committed);
                         block.set_tag(KvBlockTag::Persist);
-                        block.sampler_rng_state = [987654321, 0, 0, 0];
+                        block.sampler_rng_state = rng_state;
                     }
 
                     // Write output logits directly in shared memory OutputSlab
@@ -478,4 +510,22 @@ impl WorkerEngine {
             }
         }
     }
+}
+
+#[inline]
+fn step_xoshiro256ss(state: &mut [u64; 4]) -> u64 {
+    let result = (state[1].wrapping_mul(5)).rotate_left(7).wrapping_mul(9);
+    let t = state[1] << 17;
+    state[2] ^= state[0];
+    state[3] ^= state[1];
+    state[1] ^= state[2];
+    state[0] ^= state[3];
+    state[2] ^= t;
+    state[3] = state[3].rotate_left(45);
+    result
+}
+
+#[inline]
+fn st_is_zero(state: &[u64; 4]) -> bool {
+    state.iter().all(|&x| x == 0)
 }

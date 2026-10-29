@@ -37,8 +37,9 @@ pub use k3_core::{
 pub use kv::SingleSlotKvArena;
 pub use memory::{
     DEFAULT_PAGE_SIZE, KV_BLOCK_SIZE, MemoryFootprint, MemoryInspector, MockMemoryInspector,
-    SystemMemoryInspector, calculate_footprint, check_memory_admission,
-    check_memory_admission_with, system_page_size,
+    SystemMemoryInspector, calculate_footprint, calculate_footprint_with_slots,
+    check_memory_admission, check_memory_admission_with, check_memory_admission_with_slots,
+    system_page_size,
 };
 pub use weights::LockedModelWeights;
 
